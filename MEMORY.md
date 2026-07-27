@@ -116,12 +116,12 @@
 
 ## model_38300动作裁剪契约（2026-07-27）
 
-- 策略原始输出必须先按`normalization.clip_actions=1.2`裁剪，再乘
-  `control.action_scale=0.25`；最大关节残差为`0.3 rad`，不能把裁剪阈值除以
-  `action_scale`后放大到`4.8`。
-- 该模型的关节目标映射固定为
-  `target_q = default_q - clipped_action * action_scale`；保护后目标反算动作使用
-  `(default_q - commanded_q) / action_scale`。
+- 训练源码将`normalization.clip_actions=1.2`解释为缩放后的关节残差上限，并用
+  `clip_actions / action_scale`计算策略空间阈值；`action_scale=0.25`时策略动作裁到
+  `±4.8`，最大关节残差为`±1.2 rad`。
+- 训练端PD目标和参考部署均使用
+  `target_q = default_q + clipped_action * action_scale`；保护后目标反算动作使用
+  `(commanded_q - default_q) / action_scale`。
 - 稳态`self.actions`和观测中的`last_actions`保存裁剪后动作；Y接入保护期间保存
   实际下发目标反算出的动作，原始网络输出只用于飞行记录。
 - 本地34项测试通过，Python 3.8语法与diff检查通过；未在Jetson dry-run或真机验证。

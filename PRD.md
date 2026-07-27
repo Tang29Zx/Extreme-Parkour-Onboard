@@ -71,28 +71,30 @@ Y接入保护的回滚边界：可以移除0.5秒状态预热、1秒渐变和0.0
 
 ## 策略动作裁剪一致性
 
-策略输出必须先在策略空间按`normalization.clip_actions`裁剪，再乘
-`control.action_scale`转换为关节残差。`model_38300`的目标映射为：
+`normalization.clip_actions`定义缩放后的关节残差上限。策略输出必须先除以
+`control.action_scale`换算策略空间裁剪阈值，再乘缩放系数转换为关节残差：
 
 ```text
-clipped_action = clamp(raw_action, -clip_actions, clip_actions)
-target_q = default_q - clipped_action * action_scale
+policy_clip = clip_actions / action_scale
+clipped_action = clamp(raw_action, -policy_clip, policy_clip)
+target_q = default_q + clipped_action * action_scale
 ```
 
 验收标准：
 
-- `clip_actions=1.2`、`action_scale=0.25`时，任一关节残差不得超过`0.3 rad`。
+- `clip_actions=1.2`、`action_scale=0.25`时，策略动作裁剪上限为`±4.8`，任一关节
+  残差不得超过`1.2 rad`。
 - 稳态策略的`self.actions`和下一帧`last_actions`必须保存裁剪后动作，不能保存
   原始网络输出。
-- Y接入保护期间，`last_actions`继续由实际下发目标按同一减号映射反算；保护追平后
+- Y接入保护期间，`last_actions`继续由实际下发目标按同一加号映射反算；保护追平后
   切换为裁剪后策略动作。
 - 飞行记录同时保留原始动作、裁剪后请求目标和保护后的实际动作。
 - 非有限动作、非法裁剪上限或非法缩放系数必须在LowCmd发布前拒绝。
 
 非目标：本次不修改策略模型、动作维度、关节顺序、PD增益、机械限位或接入渐变参数。
 
-回滚方式：恢复旧动作预处理和反算公式。旧实现允许最大`1.2 rad`关节残差并会把
-未裁剪动作写入历史，回滚版本不得用于真机策略接管。
+回滚方式：恢复临时的策略空间`±1.2`裁剪会把关节残差进一步限制为`±0.3 rad`，
+但会偏离训练动作分布；该版本只能用于明确接受能力损失的保守诊断。
 
 ## model_38300关节映射修复
 

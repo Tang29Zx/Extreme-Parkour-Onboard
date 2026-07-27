@@ -283,7 +283,7 @@ def executed_target_to_action(
     scale = float(action_scale)
     if not math.isfinite(scale) or scale <= 0.0:
         raise RealControlError("action scale must be positive")
-    return (default - target) / scale
+    return (target - default) / scale
 
 
 def prepare_policy_action(
@@ -292,7 +292,7 @@ def prepare_policy_action(
     clip_actions: float,
     action_scale: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Clip policy-space actions before converting them to joint targets."""
+    """Apply the training-equivalent action clip and joint-target mapping."""
     action = _joint_vector(raw_action, "policy action")
     default = _joint_vector(default_q, "default target")
     clip_limit = float(clip_actions)
@@ -301,6 +301,7 @@ def prepare_policy_action(
         raise RealControlError("action clip limit must be positive")
     if not math.isfinite(scale) or scale <= 0.0:
         raise RealControlError("action scale must be positive")
-    clipped_action = np.clip(action, -clip_limit, clip_limit)
-    target_q = default - clipped_action * scale
+    policy_clip_limit = clip_limit / scale
+    clipped_action = np.clip(action, -policy_clip_limit, policy_clip_limit)
+    target_q = default + clipped_action * scale
     return clipped_action, target_q

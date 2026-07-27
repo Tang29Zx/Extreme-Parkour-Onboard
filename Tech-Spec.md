@@ -89,15 +89,16 @@ MotionSwitcher RPC每次2秒超时，最多3次。publisher对象可以在Releas
 
 ```text
 raw_action (12 finite values)
--> clamp to [-normalization.clip_actions, +normalization.clip_actions]
--> target_q = default_q - clipped_action * control.action_scale
+-> policy_clip = normalization.clip_actions / control.action_scale
+-> clamp to [-policy_clip, +policy_clip]
+-> target_q = default_q + clipped_action * control.action_scale
 -> policy engagement blend/slew guard
 -> LowCmd joint mapping
 ```
 
 `self.actions`在稳态保存`clipped_action`。接入保护改变最终目标时，使用
-`(default_q - commanded_q) / action_scale`反算实际动作，以保证当前观测和10帧历史
-都只包含实际执行语义。纯函数测试覆盖`±1.2`动作上限、`±0.3 rad`残差上限、减号映射
+`(commanded_q - default_q) / action_scale`反算实际动作，以保证当前观测和10帧历史
+都只包含实际执行语义。纯函数测试覆盖`±4.8`动作上限、`±1.2 rad`残差上限、加号映射
 往返和非法输入拒绝。
 
 运行时使用250周期控制环形缓冲和50帧视觉环形缓冲，不在控制循环写磁盘或打印完整

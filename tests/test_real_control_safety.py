@@ -124,7 +124,7 @@ class RealControlSafetyTest(unittest.TestCase):
     def test_executed_target_converts_to_observed_action(self):
         default = np.linspace(-0.2, 0.2, 12)
         executed_action = np.linspace(-1.0, 1.0, 12)
-        target = default - 0.25 * executed_action
+        target = default + 0.25 * executed_action
 
         np.testing.assert_allclose(
             executed_target_to_action(target, default, 0.25),
@@ -142,10 +142,13 @@ class RealControlSafetyTest(unittest.TestCase):
             action_scale=0.25,
         )
 
-        expected_action = np.clip(raw_action, -1.2, 1.2)
+        expected_action = np.clip(raw_action, -4.8, 4.8)
         np.testing.assert_allclose(clipped_action, expected_action)
-        np.testing.assert_allclose(target, default - expected_action * 0.25)
-        self.assertLessEqual(float(np.max(np.abs(target - default))), 0.3)
+        np.testing.assert_allclose(target, default + expected_action * 0.25)
+        self.assertLessEqual(
+            float(np.max(np.abs(target - default))),
+            1.2 + 1e-12,
+        )
         np.testing.assert_allclose(
             executed_target_to_action(target, default, 0.25),
             clipped_action,
