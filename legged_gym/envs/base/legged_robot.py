@@ -43,6 +43,7 @@ from typing import Tuple, Dict
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.base.base_task import BaseTask
+from legged_gym.reset_utils import resolve_dof_pos_reset_range
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import *
 from legged_gym.utils.helpers import class_to_dict
@@ -677,13 +678,21 @@ class LeggedRobot(BaseTask):
 
     def _reset_dofs(self, env_ids):
         """ Resets DOF position and velocities of selected environmments
-        Positions are randomly selected within 0.5:1.5 x default positions.
+        Positions use the configured additive range, or the legacy 0:0.9 range.
         Velocities are set to zero.
 
         Args:
             env_ids (List[int]): Environemnt ids
         """
-        self.dof_pos[env_ids] = self.default_dof_pos + torch_rand_float(0., 0.9, (len(env_ids), self.num_dof), device=self.device)
+        reset_low, reset_high = resolve_dof_pos_reset_range(
+            getattr(self.cfg.env, "dof_pos_reset_range", None)
+        )
+        self.dof_pos[env_ids] = self.default_dof_pos + torch_rand_float(
+            reset_low,
+            reset_high,
+            (len(env_ids), self.num_dof),
+            device=self.device,
+        )
         self.dof_vel[env_ids] = 0.
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)

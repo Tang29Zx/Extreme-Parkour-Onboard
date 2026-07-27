@@ -22,11 +22,30 @@ POLICY_PRIME_S = 0.5
 POLICY_PRIME_PROPRIO_SAMPLES = 10
 POLICY_PRIME_DEPTH_SAMPLES = 5
 POLICY_ENGAGEMENT_RAMP_S = 1.0
-POLICY_TARGET_MAX_STEP_RAD = 0.05
+POLICY_TRANSITION_MAX_STEP_RAD = 0.05
+POLICY_TARGET_MAX_STEP_RAD = 0.10
+POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE = 0.005
+POLICY_TARGET_MAX_DEVIATION_RAD = 0.30
+POLICY_STATE_LIMIT_TOLERANCE_RAD = 0.05
+REAL_FOOT_CONTACT_THRESHOLD = 5.0
+POLICY_ENTRY_MAX_TILT_RAD = math.radians(8.0)
+POLICY_ENTRY_MAX_TRACKING_ERROR_RAD = 0.20
 
 
 class RealControlError(RuntimeError):
     """Raised when a real-output boundary cannot be proven safe."""
+
+
+class LowStateStaleError(RealControlError):
+    """Raised when policy control has lost fresh motor feedback."""
+
+
+class DepthStaleError(RealControlError):
+    """Raised when policy control has lost fresh depth input."""
+
+
+class PolicyTargetInfeasibleError(RealControlError):
+    """Raised when no position target can satisfy every output bound."""
 
 
 def release_mode_required(active_mode: str) -> bool:
@@ -111,13 +130,11 @@ def validate_takeover_inputs(
 
 def validate_policy_prime_inputs(
     low_state_age_s: float,
-    remote_age_s: float,
     depth_age_s: float,
 ) -> None:
-    """Require fresh state, remote, and depth while priming policy memory."""
+    """Require fresh state and depth while priming policy memory."""
     ages = (
         float(low_state_age_s),
-        float(remote_age_s),
         float(depth_age_s),
     )
     if not all(
@@ -125,8 +142,139 @@ def validate_policy_prime_inputs(
         for age in ages
     ):
         raise RealControlError(
-            "LowState, remote input, and depth must be fresh for policy prime"
+            "LowState and depth must be fresh for policy prime"
         )
+
+
+def validate_policy_runtime_inputs(
+    low_state_age_s: float,
+    depth_age_s: float,
+    joint_position: Sequence[float],
+    joint_velocity: Sequence[float],
+    joint_limits_low: Sequence[float],
+    joint_limits_high: Sequence[float],
+    joint_velocity_limits: Sequence[float],
+) -> None:
+    """Require fresh, finite, physically bounded policy inputs every cycle."""
+    low_state_age = float(low_state_age_s)
+    if (
+        not math.isfinite(low_state_age)
+        or low_state_age < 0.0
+        or low_state_age > INPUT_TIMEOUT_S
+    ):
+        raise LowStateStaleError("LowState is stale during policy control")
+
+    depth_age = float(depth_age_s)
+    if (
+        not math.isfinite(depth_age)
+        or depth_age < 0.0
+        or depth_age > INPUT_TIMEOUT_S
+    ):
+        raise DepthStaleError("depth is stale during policy control")
+
+    position = _joint_vector(joint_position, "measured joint position")
+    velocity = _joint_vector(joint_velocity, "measured joint velocity")
+    lower = _joint_vector(joint_limits_low, "joint lower limits")
+    upper = _joint_vector(joint_limits_high, "joint upper limits")
+    velocity_limits = _joint_vector(
+        joint_velocity_limits,
+        "joint velocity limits",
+    )
+    if bool(np.any(lower >= upper)):
+        raise RealControlError("joint lower limits must be below upper limits")
+    if bool(np.any(velocity_limits <= 0.0)):
+        raise RealControlError("joint velocity limits must be positive")
+
+    tolerance = POLICY_STATE_LIMIT_TOLERANCE_RAD
+    if bool(
+        np.any(position < lower - tolerance)
+        or np.any(position > upper + tolerance)
+    ):
+        raise RealControlError("measured joint position exceeded its limit")
+    velocity_threshold = velocity_limits * (
+        1.0 + POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE
+    )
+    if bool(np.any(np.abs(velocity) > velocity_threshold)):
+        raise RealControlError("measured joint velocity exceeded its limit")
+
+
+def validate_policy_request_input(remote_age_s: float) -> None:
+    """Require a fresh remote sample at the instant policy entry is requested."""
+    age = float(remote_age_s)
+    if not math.isfinite(age) or not 0.0 <= age <= INPUT_TIMEOUT_S:
+        raise RealControlError("remote input must be fresh when Y is pressed")
+
+
+def _finite_vector(values: Sequence[float], size: int, name: str) -> np.ndarray:
+    result = np.asarray(values, dtype=np.float64)
+    if result.shape != (size,) or not np.isfinite(result).all():
+        raise RealControlError(f"{name} must contain {size} finite values")
+    return result
+
+
+def classify_foot_contacts(
+    foot_force: Sequence[float],
+    threshold: float = REAL_FOOT_CONTACT_THRESHOLD,
+) -> np.ndarray:
+    """Classify model-order real foot-force samples without temporal filtering."""
+    forces = _finite_vector(foot_force, 4, "foot force")
+    contact_threshold = float(threshold)
+    if not math.isfinite(contact_threshold) or contact_threshold < 0.0:
+        raise RealControlError("foot contact threshold must be finite and non-negative")
+    return forces > contact_threshold
+
+
+def filter_foot_contacts(
+    foot_force: Sequence[float],
+    previous_contact: Sequence[bool],
+    threshold: float = REAL_FOOT_CONTACT_THRESHOLD,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply the training-equivalent current-or-previous contact filter."""
+    current = classify_foot_contacts(foot_force, threshold)
+    previous = np.asarray(previous_contact, dtype=np.bool_)
+    if previous.shape != (4,):
+        raise RealControlError("previous contact must contain 4 values")
+    return np.logical_or(current, previous), current
+
+
+def validate_policy_entry_state(
+    foot_force: Sequence[float],
+    roll_rad: float,
+    pitch_rad: float,
+    measured_q: Sequence[float],
+    commanded_q: Sequence[float],
+    motor_temperature: Sequence[float],
+    motor_lost: Sequence[float],
+    motor_lost_baseline: Sequence[float],
+) -> None:
+    """Require a loaded, upright, healthy, tracked stand before accepting Y."""
+    contacts = classify_foot_contacts(foot_force)
+    if not bool(np.all(contacts)):
+        missing = np.flatnonzero(~contacts).tolist()
+        raise RealControlError(f"all four feet must be loaded; missing contacts {missing}")
+
+    tilt = _finite_vector((roll_rad, pitch_rad), 2, "roll and pitch")
+    if float(np.max(np.abs(tilt))) > POLICY_ENTRY_MAX_TILT_RAD:
+        raise RealControlError("body tilt is too large for policy entry")
+
+    measured = _joint_vector(measured_q, "measured joint position")
+    commanded = _joint_vector(commanded_q, "commanded joint position")
+    if (
+        float(np.max(np.abs(measured - commanded)))
+        > POLICY_ENTRY_MAX_TRACKING_ERROR_RAD
+    ):
+        raise RealControlError("joint tracking error is too large for policy entry")
+
+    _finite_vector(motor_temperature, 12, "motor temperature")
+
+    lost = _finite_vector(motor_lost, 12, "motor lost status")
+    baseline = _finite_vector(
+        motor_lost_baseline,
+        12,
+        "motor lost baseline",
+    )
+    if bool(np.any(lost > baseline)):
+        raise RealControlError("one or more motor lost counters increased")
 
 
 def quintic_smoothstep(progress: float) -> float:
@@ -211,18 +359,28 @@ class PolicyTransitionGuard:
     def __init__(
         self,
         ramp_s: float = POLICY_ENGAGEMENT_RAMP_S,
-        max_step_rad: float = POLICY_TARGET_MAX_STEP_RAD,
+        max_step_rad: float = POLICY_TRANSITION_MAX_STEP_RAD,
+        max_deviation_rad: float = POLICY_TARGET_MAX_DEVIATION_RAD,
     ) -> None:
         self.ramp_s = float(ramp_s)
         self.max_step_rad = float(max_step_rad)
+        self.max_deviation_rad = float(max_deviation_rad)
         if not math.isfinite(self.ramp_s) or self.ramp_s <= 0.0:
             raise ValueError("policy ramp duration must be positive")
         if not math.isfinite(self.max_step_rad) or self.max_step_rad <= 0.0:
             raise ValueError("policy target step must be positive")
+        if (
+            not math.isfinite(self.max_deviation_rad)
+            or self.max_deviation_rad <= 0.0
+        ):
+            raise ValueError("policy target deviation must be positive")
         self.start_time = None
         self.start_q = None
         self.previous_q = None
         self.first_apply = False
+        self.pending_requested_q = None
+        self.pending_target_q = None
+        self.pending_elapsed_s = None
 
     @property
     def active(self) -> bool:
@@ -237,39 +395,81 @@ class PolicyTransitionGuard:
         self.start_q = start.copy()
         self.previous_q = start.copy()
         self.first_apply = True
+        self.pending_requested_q = None
+        self.pending_target_q = None
+        self.pending_elapsed_s = None
 
     def apply(self, requested_q: Sequence[float], now: float) -> np.ndarray:
         if not self.active or self.start_q is None or self.previous_q is None:
             raise RealControlError("policy transition was not initialized")
+        if self.pending_target_q is not None:
+            raise RealControlError(
+                "executed policy target feedback is required before the next "
+                "transition target"
+            )
         requested = _joint_vector(requested_q, "policy target")
         timestamp = float(now)
         if not math.isfinite(timestamp):
             raise RealControlError("policy transition time must be finite")
+        elapsed = max(0.0, timestamp - float(self.start_time))
         if self.first_apply:
             self.first_apply = False
-            return self.start_q.copy()
-        elapsed = max(0.0, timestamp - float(self.start_time))
-        blend = quintic_smoothstep(elapsed / self.ramp_s)
-        blended = self.start_q + blend * (requested - self.start_q)
-        delta = np.clip(
-            blended - self.previous_q,
-            -self.max_step_rad,
-            self.max_step_rad,
-        )
-        target = self.previous_q + delta
-        self.previous_q = target.copy()
-        if (
-            elapsed >= self.ramp_s
-            and float(np.max(np.abs(requested - target))) <= 1e-12
-        ):
-            self.reset()
+            target = self.start_q.copy()
+        else:
+            blend = quintic_smoothstep(elapsed / self.ramp_s)
+            blended = self.start_q + blend * (requested - self.start_q)
+            if elapsed < self.ramp_s:
+                bounded = np.clip(
+                    blended,
+                    self.start_q - self.max_deviation_rad,
+                    self.start_q + self.max_deviation_rad,
+                )
+            else:
+                bounded = requested
+            delta = np.clip(
+                bounded - self.previous_q,
+                -self.max_step_rad,
+                self.max_step_rad,
+            )
+            target = self.previous_q + delta
+        self.pending_requested_q = requested.copy()
+        self.pending_target_q = target.copy()
+        self.pending_elapsed_s = elapsed
         return target
+
+    def record_executed_target(self, executed_q: Sequence[float]) -> None:
+        """Commit the target that passed all downstream safety constraints."""
+        if (
+            not self.active
+            or self.previous_q is None
+            or self.pending_requested_q is None
+            or self.pending_target_q is None
+            or self.pending_elapsed_s is None
+        ):
+            raise RealControlError("policy transition has no pending target")
+        executed = _joint_vector(executed_q, "executed policy target")
+        executed_step = float(np.max(np.abs(executed - self.previous_q)))
+        if executed_step > self.max_step_rad + 1e-12:
+            raise RealControlError(
+                "executed policy target exceeded the transition step limit"
+            )
+        elapsed = self.pending_elapsed_s
+        self.previous_q = executed.copy()
+        if elapsed >= self.ramp_s:
+            self.reset()
+            return
+        self.pending_requested_q = None
+        self.pending_target_q = None
+        self.pending_elapsed_s = None
 
     def reset(self) -> None:
         self.start_time = None
         self.start_q = None
         self.previous_q = None
         self.first_apply = False
+        self.pending_requested_q = None
+        self.pending_target_q = None
+        self.pending_elapsed_s = None
 
 
 def executed_target_to_action(
@@ -291,8 +491,8 @@ def prepare_policy_action(
     default_q: Sequence[float],
     clip_actions: float,
     action_scale: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply the training-equivalent action clip and joint-target mapping."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return raw history action, clipped action, and scaled joint target."""
     action = _joint_vector(raw_action, "policy action")
     default = _joint_vector(default_q, "default target")
     clip_limit = float(clip_actions)
@@ -304,4 +504,54 @@ def prepare_policy_action(
     policy_clip_limit = clip_limit / scale
     clipped_action = np.clip(action, -policy_clip_limit, policy_clip_limit)
     target_q = default + clipped_action * scale
-    return clipped_action, target_q
+    return action.copy(), clipped_action, target_q
+
+
+def constrain_policy_target(
+    requested_q: Sequence[float],
+    previous_q: Sequence[float],
+    measured_q: Sequence[float],
+    measured_dq: Sequence[float],
+    kp: Sequence[float],
+    kd: Sequence[float],
+    joint_limits_low: Sequence[float],
+    joint_limits_high: Sequence[float],
+    torque_limits: Sequence[float],
+    max_step_rad: float = POLICY_TARGET_MAX_STEP_RAD,
+) -> np.ndarray:
+    """Intersect step, joint, and estimated PD-torque bounds for one target."""
+    requested = _joint_vector(requested_q, "requested joint target")
+    previous = _joint_vector(previous_q, "previous joint target")
+    measured = _joint_vector(measured_q, "measured joint position")
+    measured_velocity = _joint_vector(
+        measured_dq,
+        "measured joint velocity",
+    )
+    p_gain = _joint_vector(kp, "joint proportional gains")
+    d_gain = _joint_vector(kd, "joint derivative gains")
+    joint_lower = _joint_vector(joint_limits_low, "joint lower limits")
+    joint_upper = _joint_vector(joint_limits_high, "joint upper limits")
+    torque = _joint_vector(torque_limits, "joint torque limits")
+    max_step = float(max_step_rad)
+
+    if not math.isfinite(max_step) or max_step <= 0.0:
+        raise RealControlError("policy target step must be positive")
+    if bool(np.any(p_gain <= 0.0)):
+        raise RealControlError("joint proportional gains must be positive")
+    if bool(np.any(d_gain < 0.0)):
+        raise RealControlError("joint derivative gains must be non-negative")
+    if bool(np.any(joint_lower >= joint_upper)):
+        raise RealControlError("joint lower limits must be below upper limits")
+    if bool(np.any(torque <= 0.0)):
+        raise RealControlError("joint torque limits must be positive")
+
+    torque_lower = measured + (-torque + d_gain * measured_velocity) / p_gain
+    torque_upper = measured + (torque + d_gain * measured_velocity) / p_gain
+    lower = np.maximum.reduce((previous - max_step, joint_lower, torque_lower))
+    upper = np.minimum.reduce((previous + max_step, joint_upper, torque_upper))
+    if bool(np.any(lower > upper)):
+        joints = np.flatnonzero(lower > upper).tolist()
+        raise PolicyTargetInfeasibleError(
+            f"no safe policy target satisfies all bounds for joints {joints}"
+        )
+    return np.clip(requested, lower, upper)

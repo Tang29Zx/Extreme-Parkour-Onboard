@@ -3,15 +3,27 @@ import unittest
 import numpy as np
 
 from real_control_safety import (
+    DepthStaleError,
+    LowStateStaleError,
+    POLICY_TRANSITION_MAX_STEP_RAD,
+    POLICY_TARGET_MAX_DEVIATION_RAD,
     POLICY_TARGET_MAX_STEP_RAD,
+    POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE,
+    PolicyTargetInfeasibleError,
     PolicyPrimeGate,
     PolicyTransitionGuard,
     RealControlError,
+    classify_foot_contacts,
+    constrain_policy_target,
     executed_target_to_action,
+    filter_foot_contacts,
     interpolate_pose,
     prepare_policy_action,
     release_mode_required,
     validate_policy_prime_inputs,
+    validate_policy_runtime_inputs,
+    validate_policy_request_input,
+    validate_policy_entry_state,
     validate_real_low_command_publish,
     validate_takeover_inputs,
 )
@@ -61,27 +73,125 @@ class RealControlSafetyTest(unittest.TestCase):
         self.assertFalse(gate.ready(21.0))
 
     def test_policy_prime_rejects_stale_or_nonfinite_inputs(self):
-        validate_policy_prime_inputs(0.1, 0.1, 0.1)
+        validate_policy_prime_inputs(0.1, 0.1)
         with self.assertRaisesRegex(RealControlError, "fresh"):
-            validate_policy_prime_inputs(0.1, 0.1, 0.26)
+            validate_policy_prime_inputs(0.1, 0.26)
         with self.assertRaisesRegex(RealControlError, "fresh"):
-            validate_policy_prime_inputs(np.nan, 0.1, 0.1)
+            validate_policy_prime_inputs(np.nan, 0.1)
+
+    def test_policy_runtime_rejects_stale_or_out_of_range_inputs(self):
+        lower = np.full(12, -1.0)
+        upper = np.full(12, 1.0)
+        velocity_limits = np.full(12, 20.0)
+        position = np.zeros(12)
+        velocity = np.zeros(12)
+
+        validate_policy_runtime_inputs(
+            0.1,
+            0.1,
+            position,
+            velocity,
+            lower,
+            upper,
+            velocity_limits,
+        )
+        with self.assertRaisesRegex(LowStateStaleError, "LowState"):
+            validate_policy_runtime_inputs(
+                0.26,
+                0.1,
+                position,
+                velocity,
+                lower,
+                upper,
+                velocity_limits,
+            )
+        with self.assertRaisesRegex(DepthStaleError, "depth"):
+            validate_policy_runtime_inputs(
+                0.1,
+                0.26,
+                position,
+                velocity,
+                lower,
+                upper,
+                velocity_limits,
+            )
+        position[2] = 1.051
+        with self.assertRaisesRegex(RealControlError, "position"):
+            validate_policy_runtime_inputs(
+                0.1,
+                0.1,
+                position,
+                velocity,
+                lower,
+                upper,
+                velocity_limits,
+            )
+        position[2] = 0.0
+        velocity[5] = 20.11
+        with self.assertRaisesRegex(RealControlError, "velocity"):
+            validate_policy_runtime_inputs(
+                0.1,
+                0.1,
+                position,
+                velocity,
+                lower,
+                upper,
+                velocity_limits,
+            )
+
+    def test_policy_runtime_velocity_tolerance_is_bounded(self):
+        lower = np.full(12, -1.0)
+        upper = np.full(12, 1.0)
+        velocity_limits = np.full(12, 20.0)
+        position = np.zeros(12)
+        velocity = np.zeros(12)
+        velocity[5] = 20.0 * (
+            1.0 + POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE
+        )
+
+        validate_policy_runtime_inputs(
+            0.1,
+            0.1,
+            position,
+            velocity,
+            lower,
+            upper,
+            velocity_limits,
+        )
+        velocity[5] += 1e-6
+        with self.assertRaisesRegex(RealControlError, "velocity"):
+            validate_policy_runtime_inputs(
+                0.1,
+                0.1,
+                position,
+                velocity,
+                lower,
+                upper,
+                velocity_limits,
+            )
+
+    def test_policy_request_requires_remote_only_when_y_is_pressed(self):
+        validate_policy_request_input(0.1)
+        with self.assertRaisesRegex(RealControlError, "remote"):
+            validate_policy_request_input(0.26)
 
     def test_policy_transition_starts_exactly_and_limits_every_step(self):
-        guard = PolicyTransitionGuard()
+        guard = PolicyTransitionGuard(max_deviation_rad=2.0)
         stand = np.zeros(12)
         requested = np.ones(12)
         guard.begin(stand, 10.0)
 
         first = guard.apply(requested, 10.2)
+        guard.record_executed_target(first)
         np.testing.assert_array_equal(first, stand)
         previous = first
         for index in range(1, 101):
             target = guard.apply(requested, 10.2 + index * 0.02)
             self.assertLessEqual(
                 float(np.max(np.abs(target - previous))),
-                POLICY_TARGET_MAX_STEP_RAD + 1e-12,
+                POLICY_TRANSITION_MAX_STEP_RAD + 1e-12,
             )
+            guard.record_executed_target(target)
             previous = target
             if not guard.active:
                 break
@@ -103,23 +213,160 @@ class RealControlSafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(RealControlError, "12 finite values"):
             guard.apply(np.zeros(11), 0.1)
 
-    def test_policy_transition_stays_active_after_ramp_until_caught_up(self):
+    def test_policy_transition_tracks_the_executed_downstream_target(self):
+        guard = PolicyTransitionGuard(max_deviation_rad=2.0)
+        stand = np.zeros(12)
+        requested = np.ones(12)
+        guard.begin(stand, 0.0)
+
+        first = guard.apply(requested, 0.0)
+        with self.assertRaisesRegex(RealControlError, "feedback"):
+            guard.apply(requested, 0.02)
+        guard.record_executed_target(first)
+
+        guard.apply(requested, 0.5)
+        downstream_target = np.full(12, 0.01)
+        guard.record_executed_target(downstream_target)
+        next_target = guard.apply(requested, 0.52)
+
+        self.assertLessEqual(
+            float(np.max(np.abs(next_target - downstream_target))),
+            POLICY_TRANSITION_MAX_STEP_RAD + 1e-12,
+        )
+        np.testing.assert_allclose(next_target, 0.06)
+
+    def test_policy_transition_ends_after_the_full_ramp(self):
         guard = PolicyTransitionGuard()
         stand = np.zeros(12)
         requested = np.full(12, 10.0)
         guard.begin(stand, 0.0)
 
         previous = guard.apply(requested, 0.0)
-        for index in range(1, 60):
+        guard.record_executed_target(previous)
+        for index in range(1, 51):
             target = guard.apply(requested, index * 0.02)
             self.assertLessEqual(
                 float(np.max(np.abs(target - previous))),
-                POLICY_TARGET_MAX_STEP_RAD + 1e-12,
+                POLICY_TRANSITION_MAX_STEP_RAD + 1e-12,
             )
+            guard.record_executed_target(target)
             previous = target
 
-        self.assertTrue(guard.active)
+        self.assertFalse(guard.active)
         self.assertGreater(float(np.max(np.abs(requested - previous))), 0.05)
+
+    def test_policy_transition_limits_the_complete_first_second(self):
+        guard = PolicyTransitionGuard()
+        stand = np.linspace(-0.2, 0.2, 12)
+        requested = stand + 2.0
+        guard.begin(stand, 0.0)
+
+        previous = guard.apply(requested, 0.0)
+        guard.record_executed_target(previous)
+        for index in range(1, 50):
+            target = guard.apply(requested, index * 0.02)
+            self.assertLessEqual(
+                float(np.max(np.abs(target - previous))),
+                POLICY_TRANSITION_MAX_STEP_RAD + 1e-12,
+            )
+            self.assertLessEqual(
+                float(np.max(np.abs(target - stand))),
+                POLICY_TARGET_MAX_DEVIATION_RAD + 1e-12,
+            )
+            guard.record_executed_target(target)
+            previous = target
+        self.assertTrue(guard.active)
+
+        target = guard.apply(requested, 1.0)
+        self.assertLessEqual(
+            float(np.max(np.abs(target - previous))),
+            POLICY_TRANSITION_MAX_STEP_RAD + 1e-12,
+        )
+        guard.record_executed_target(target)
+        self.assertFalse(guard.active)
+
+    def test_real_contact_filter_matches_training_one_frame_memory(self):
+        forces = np.asarray([8.0, 11.0, 0.0, 6.0])
+        np.testing.assert_array_equal(
+            classify_foot_contacts(forces),
+            [True, True, False, True],
+        )
+        filtered, current = filter_foot_contacts(
+            [0.0, 0.0, 0.0, 0.0],
+            [True, False, True, False],
+        )
+        np.testing.assert_array_equal(filtered, [True, False, True, False])
+        filtered, _ = filter_foot_contacts(
+            [0.0, 0.0, 0.0, 0.0],
+            current,
+        )
+        np.testing.assert_array_equal(filtered, [False, False, False, False])
+
+    def test_policy_entry_requires_loaded_upright_tracked_healthy_stand(self):
+        measured = np.zeros(12)
+        commanded = np.zeros(12)
+        temperatures = np.full(12, 90.0)
+        lost = np.full(12, 5.0)
+
+        # Temperature remains diagnostic-only and must not block policy entry.
+        validate_policy_entry_state(
+            [8.0, 9.0, 10.0, 11.0],
+            0.0,
+            0.0,
+            measured,
+            commanded,
+            temperatures,
+            lost,
+            lost,
+        )
+        with self.assertRaisesRegex(RealControlError, "four feet"):
+            validate_policy_entry_state(
+                [8.0, 0.0, 10.0, 11.0],
+                0.0,
+                0.0,
+                measured,
+                commanded,
+                temperatures,
+                lost,
+                lost,
+            )
+        with self.assertRaisesRegex(RealControlError, "tilt"):
+            validate_policy_entry_state(
+                [8.0, 9.0, 10.0, 11.0],
+                np.deg2rad(9.0),
+                0.0,
+                measured,
+                commanded,
+                temperatures,
+                lost,
+                lost,
+            )
+        commanded[3] = 0.21
+        with self.assertRaisesRegex(RealControlError, "tracking"):
+            validate_policy_entry_state(
+                [8.0, 9.0, 10.0, 11.0],
+                0.0,
+                0.0,
+                measured,
+                commanded,
+                temperatures,
+                lost,
+                lost,
+            )
+        commanded[3] = 0.0
+        baseline = lost.copy()
+        lost[5] = 6.0
+        with self.assertRaisesRegex(RealControlError, "increased"):
+            validate_policy_entry_state(
+                [8.0, 9.0, 10.0, 11.0],
+                0.0,
+                0.0,
+                measured,
+                commanded,
+                temperatures,
+                lost,
+                baseline,
+            )
 
     def test_executed_target_converts_to_observed_action(self):
         default = np.linspace(-0.2, 0.2, 12)
@@ -135,7 +382,7 @@ class RealControlSafetyTest(unittest.TestCase):
         raw_action = np.linspace(-6.0, 6.0, 12)
         default = np.linspace(-0.3, 0.3, 12)
 
-        clipped_action, target = prepare_policy_action(
+        observed_action, clipped_action, target = prepare_policy_action(
             raw_action,
             default,
             clip_actions=1.2,
@@ -143,6 +390,7 @@ class RealControlSafetyTest(unittest.TestCase):
         )
 
         expected_action = np.clip(raw_action, -4.8, 4.8)
+        np.testing.assert_allclose(observed_action, raw_action)
         np.testing.assert_allclose(clipped_action, expected_action)
         np.testing.assert_allclose(target, default + expected_action * 0.25)
         self.assertLessEqual(
@@ -165,6 +413,56 @@ class RealControlSafetyTest(unittest.TestCase):
             prepare_policy_action(np.zeros(12), default, 0.0, 0.25)
         with self.assertRaisesRegex(RealControlError, "action scale"):
             prepare_policy_action(np.zeros(12), default, 1.2, np.inf)
+
+    def test_policy_target_intersects_step_joint_and_torque_bounds(self):
+        requested = np.full(12, 10.0)
+        previous = np.zeros(12)
+        measured = np.zeros(12)
+        velocity = np.zeros(12)
+        kp = np.full(12, 100.0)
+        kd = np.full(12, 1.0)
+        lower = np.full(12, -1.0)
+        upper = np.full(12, 1.0)
+        torque = np.full(12, 1.0)
+
+        target = constrain_policy_target(
+            requested,
+            previous,
+            measured,
+            velocity,
+            kp,
+            kd,
+            lower,
+            upper,
+            torque,
+        )
+
+        # Torque is the tightest bound here: 100 * 0.01 == 1 Nm.
+        np.testing.assert_allclose(target, 0.01)
+        self.assertLessEqual(
+            float(np.max(np.abs(target - previous))),
+            POLICY_TARGET_MAX_STEP_RAD,
+        )
+        self.assertTrue(bool(np.all(target <= upper)))
+        estimated_torque = kp * (target - measured) - kd * velocity
+        self.assertTrue(bool(np.all(np.abs(estimated_torque) <= torque)))
+
+    def test_policy_target_rejects_an_empty_safe_intersection(self):
+        with self.assertRaisesRegex(
+            PolicyTargetInfeasibleError,
+            "no safe policy target",
+        ):
+            constrain_policy_target(
+                requested_q=np.zeros(12),
+                previous_q=np.ones(12),
+                measured_q=-np.ones(12),
+                measured_dq=np.zeros(12),
+                kp=np.full(12, 100.0),
+                kd=np.ones(12),
+                joint_limits_low=np.full(12, -2.0),
+                joint_limits_high=np.full(12, 2.0),
+                torque_limits=np.ones(12),
+            )
 
 if __name__ == "__main__":
     unittest.main()

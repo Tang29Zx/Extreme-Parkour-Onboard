@@ -63,20 +63,31 @@ ReleaseMode前预创建自己的publisher并锁存实测关节角，但保持真
 CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命令，不等待
 原生publisher endpoint从DDS图中消失。
 
-`traced/`中的`model_38300`策略包使用训练顺序`FL/FR/RL/RR`；节点在LowState/LowCmd
-边界与Unitree的`FR/FL/RR/RL`顺序互换，并同步重排脚端力。更换其他权重时
-必须重新确认其训练关节顺序，不能仅凭对称站姿判断兼容。
+`traced/`中的`model_38300`在Isaac内部使用`FL/FR/RL/RR`，但训练环境在actor边界
+已经重排为`FR/FL/RR/RL`。该顺序与Unitree电机和脚端力一致，控制节点不得再次
+交换左右腿。更换其他权重时必须从其训练源码和导出包装器确认actor边界，不能只凭
+对称站姿或映射往返判断兼容。
 
 - 接管后先等待3秒站姿渐变，再等待0.5秒本体历史和视觉GRU预热；看到
   `Policy prime complete`后才可按Y。
+- policy prime和按Y瞬间都会确认四足承重、roll/pitch不超过8°、最大关节跟踪
+  误差不超过0.2 rad且12个电机`lost`计数没有继续增长；历史非零计数允许通过。
+  prime只要求LowState和深度持续新鲜，按Y瞬间才检查遥控器。不满足时保持站姿并
+  打印拒绝原因；电机温度只写入飞行记录，不阻止进入策略。
 - 短按并释放 **Y** 进入策略；前1秒以五次曲线接入且每周期最多变化0.05 rad，
-  与策略目标追平后恢复上游目标直通。
+  第1秒相对起点还限制在0.3 rad以内。接入完成后以0.10 rad/周期持续限制目标变化、机械
+  关节范围和估算PD力矩；策略观测中的`last_actions`保持上一帧actor原始输出。
+  接入后不根据姿态自动motor-off。
+- policy运行中每周期检查LowState、深度、关节位置和速度。深度过期或状态越界时
+  进入站姿恢复；LowState超过0.25秒没有更新，或不存在同时满足步长、关节和力矩
+  约束的目标时执行motor-off硬停止，因此必须先在承重支架验收这些故障路径。
 - 短按 **L2** 退出策略并用1秒回到站姿；不会在`/lowcmd` publisher
-  存在时自动恢复Sport Mode。
+  存在时自动恢复Sport Mode。L2不会根据倾斜角自动motor-off。
 - **R2** 是低层接管后的电机关闭急停，机器狗会失去支撑力。
 - `Ctrl+C`退出时也会发送10帧motor-off命令，因此只能在支架承重时停止。
 - `--flight-log-dir`可指定飞行记录目录，默认`~/extreme-flight-logs`；L2、R2、
-  异常或退出时会保存最近5秒数据并在日志中打印文件路径。
+  异常或退出时会保存最近5秒数据并在日志中打印文件路径。记录包含12电机温度、
+  `lost`、估算力矩和四足接触判定。
 
 ## Notes and Tips
 
@@ -101,6 +112,48 @@ python3 run_extreme_parkour.py --logdir traced --mode walk
 消息，不创建Sport Mode API发布端；遥控器按键只切换节点内部状态，
 不会调用机器狗的Sport Mode或真实`/lowcmd`。短按L1后，dry-run会执行与
 真机相同的3秒站姿、0.5秒policy prime和Y接入保护，便于先验收状态机。
+
+## Unitree边界S2S回放
+
+`replay_unitree_boundary.py`在Isaac Gym中合成LowState并接收LowCmd等价数据，
+不会启动ROS、DDS或真机输出。默认Viewer显示三条相同赛道：蓝色是actor直连基准，
+绿色经过修复后的完整Unitree边界，红色注入旧版左右腿二次重排故障。
+
+该Viewer只能在安装Isaac Gym的x86_64 Ubuntu NVIDIA工作站运行，不能在Jetson或
+RViz中查看。旧版Isaac Gym可能不兼容RTX 50系和较新驱动；若非headless在Viewer
+初始化阶段退出139，应换用已验证的Isaac Gym显卡/驱动环境，headless结果不能替代
+视觉验收。示例环境使用本机Python 3.8 Isaac Gym配置：
+
+```bash
+cd /home/tang/Extreme-Parkour-Onboard
+export PATH=/home/tang/miniconda3/pkgs/ninja-1.13.2-h171cf75_0/bin:$PATH
+export LD_LIBRARY_PATH=/home/tang/miniconda3/envs/hybrik/lib
+export PYTHONPATH=/home/tang/extreme-parkour-go2/isaacgym/python:$PWD:$PWD/rsl_rl
+export PARKOUR_RESOURCES_DIR=/home/tang/extreme-parkour-go2/legged_gym/resources
+
+EXTREME_REPLAY_STEPS=1000 \
+EXTREME_BOUNDARY_COMPARISON=abc \
+EXTREME_BOUNDARY_GUARDS=full \
+/home/tang/miniconda3/envs/hybrik/bin/python \
+  legged_gym/scripts/replay_unitree_boundary.py \
+  --task go2 --device cpu --pipeline cpu
+```
+
+加入`--headless`执行无窗口验收；使用`EXTREME_BOUNDARY_COMPARISON=fixed`只运行绿色
+边界。`EXTREME_BOUNDARY_GUARDS=mapping`保留1秒接入渐变但关闭稳态输出约束，只用于
+隔离顺序、观测和LowCmd往返问题，不能代表真机安全链。默认`full`会执行生产端每周期
+输入检查、接入期0.05 rad/周期、稳态0.10 rad/周期、机械限位和估算PD力矩约束。
+关节速度检查对URDF标称上限保留0.5%测量容差，超出该容差仍会停止策略。
+
+每次运行都会在`~/extreme-boundary-s2s`保存无pickle NPZ；可用
+`EXTREME_BOUNDARY_LOG_DIR`覆盖目录。日志同时包含actor、Unitree motor和Isaac顺序、
+原始动作、请求/下发目标、接触、估算力矩、reset、保护故障和最终验收结果。完整验收
+失败时脚本以非零状态退出，而不会把reset或保护硬停隐藏为成功。
+
+2026-07-28的Python 3.8 CPU PhysX验收中，绿色B在第426步越过箱体后缘
+`x=3.40 m`，结果为PASS；接入期最大目标变化0.05 rad、稳态0.10 rad、最大估算
+力矩比例0.8535，且无reset、保护故障或LowCmd/PhysX目标差异。三路`abc/full`回放也在
+第426步由绿色B完成，红色C因旧二次重排造成入口跟踪误差而保持站姿。
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
 
 ## Performance 

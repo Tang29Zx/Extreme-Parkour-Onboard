@@ -49,6 +49,10 @@ class FlightRecorder:
         measured_dq: Sequence[float],
         imu_quaternion: Sequence[float],
         foot_force: Sequence[float],
+        contact_state: Sequence[float],
+        motor_temperature: Sequence[float],
+        motor_lost: Sequence[float],
+        motor_tau_est: Sequence[float],
         input_ages: Sequence[float],
         loop_s: float,
     ) -> None:
@@ -72,6 +76,16 @@ class FlightRecorder:
                     imu_quaternion, 4, "IMU quaternion"
                 ),
                 "foot_force": _finite_vector(foot_force, 4, "foot force"),
+                "contact_state": _finite_vector(
+                    contact_state, 4, "contact state"
+                ),
+                "motor_temperature": _finite_vector(
+                    motor_temperature, 12, "motor temperature"
+                ),
+                "motor_lost": _finite_vector(motor_lost, 12, "motor lost"),
+                "motor_tau_est": _finite_vector(
+                    motor_tau_est, 12, "estimated motor torque"
+                ),
                 "input_ages": _finite_vector(input_ages, 3, "input ages"),
                 "loop_s": float(loop_s),
             }
@@ -110,7 +124,7 @@ class FlightRecorder:
         controls = list(self.control_records)
         visuals = list(self.visual_records)
         payload = {
-            "format_version": np.asarray([1], dtype=np.int32),
+            "format_version": np.asarray([2], dtype=np.int32),
             "reason": np.asarray([str(reason)]),
             "control_timestamp": np.asarray(
                 [record["timestamp"] for record in controls], dtype=np.float64
@@ -135,6 +149,10 @@ class FlightRecorder:
             "measured_dq": 12,
             "imu_quaternion": 4,
             "foot_force": 4,
+            "contact_state": 4,
+            "motor_temperature": 12,
+            "motor_lost": 12,
+            "motor_tau_est": 12,
             "input_ages": 3,
         }
         for name, width in control_vectors.items():

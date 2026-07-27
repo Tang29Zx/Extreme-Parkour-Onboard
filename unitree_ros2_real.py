@@ -29,20 +29,38 @@ from real_control_safety import (
     RELEASE_MODE_API_ID,
     RPC_MAX_ATTEMPTS,
     RPC_TIMEOUT_S,
+    POLICY_TARGET_MAX_STEP_RAD,
     STARTUP_RAMP_S,
     TAKEOVER_HOLD_S,
+    DepthStaleError,
+    LowStateStaleError,
     PolicyPrimeGate,
     PolicyTransitionGuard,
     RealControlError,
     build_motion_request,
+    constrain_policy_target,
     executed_target_to_action,
+    filter_foot_contacts,
     interpolate_pose,
     parse_motion_response,
     prepare_policy_action,
     release_mode_required,
     validate_policy_prime_inputs,
+    validate_policy_runtime_inputs,
+    validate_policy_request_input,
+    validate_policy_entry_state,
     validate_real_low_command_publish,
     validate_takeover_inputs,
+)
+from unitree_boundary import (
+    BoundaryLowState,
+    GO2_JOINT_LIMITS_HIGH,
+    GO2_JOINT_LIMITS_LOW,
+    GO2_JOINT_VELOCITY_LIMITS,
+    GO2_TORQUE_LIMITS,
+    build_policy_proprio,
+    decode_low_state,
+    encode_low_cmd,
 )
 
 if os.uname().machine in ["x86_64", "amd64"]:
@@ -100,24 +118,26 @@ class RobotCfgs:
         dof_map = SIM_TO_REAL_DOF
         dof_names = SIM_DOF_NAMES
         dof_signs = DOF_SIGNS
-        joint_limits_high = torch.tensor([
-            1.0472, 3.4907, -0.83776,
-            1.0472, 3.4907, -0.83776,
-            1.0472, 4.5379, -0.83776,
-            1.0472, 4.5379, -0.83776,
-        ], device= "cpu", dtype= torch.float32)
-        joint_limits_low = torch.tensor([
-            -1.0472, -1.5708, -2.7227,
-            -1.0472, -1.5708, -2.7227,
-            -1.0472, -0.5236, -2.7227,
-            -1.0472, -0.5236, -2.7227,
-        ], device= "cpu", dtype= torch.float32)
-        torque_limits = torch.tensor([ # from urdf and in simulation order
-            25, 40, 40,
-            25, 40, 40,
-            25, 40, 40,
-            25, 40, 40,
-        ], device= "cpu", dtype= torch.float32)
+        joint_limits_high = torch.as_tensor(
+            GO2_JOINT_LIMITS_HIGH.copy(),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        joint_limits_low = torch.as_tensor(
+            GO2_JOINT_LIMITS_LOW.copy(),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        torque_limits = torch.as_tensor(
+            GO2_TORQUE_LIMITS.copy(),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        joint_velocity_limits = torch.as_tensor(
+            GO2_JOINT_VELOCITY_LIMITS.copy(),
+            device="cpu",
+            dtype=torch.float32,
+        )
         turn_on_motor_mode = [0x01] * 12
         
 
@@ -194,6 +214,8 @@ class UnitreeRos2Real(Node):
         self.last_command_target_q = None
         self.policy_prime_gate = None
         self.policy_prime_cycle = 0
+        self.policy_prime_rejection_reason = None
+        self.policy_lost_baseline = None
         self.policy_depth_reset = None
         self.policy_transition = PolicyTransitionGuard()
         self.joy_stick_topic = joy_stick_topic
@@ -227,8 +249,8 @@ class UnitreeRos2Real(Node):
         self.episode_length_buf = torch.zeros(1, device=self.model_device, dtype=torch.float)
         self.forward_depth_latent_yaw_buffer = torch.zeros(1, self.n_depth_latent+2, device=self.model_device, dtype=torch.float)
         self.xyyaw_command = torch.tensor([[0, 0, 0]], device= self.model_device, dtype= torch.float32)
-        self.contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
-        self.last_contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
+        self.contact_filt = torch.full((1, 4), -0.5, device=self.model_device, dtype=torch.float32)
+        self.last_contacts = np.zeros(4, dtype=np.bool_)
 
         self.parse_config()
         self.init_stand_config()
@@ -264,8 +286,8 @@ class UnitreeRos2Real(Node):
         self.episode_length_buf = torch.zeros(1, device=self.model_device, dtype=torch.float)
         self.forward_depth_latent_yaw_buffer = torch.zeros(1, self.n_depth_latent+2, device=self.model_device, dtype=torch.float)
         self.xyyaw_command = torch.tensor([[0, 0, 0]], device= self.model_device, dtype= torch.float32)
-        self.contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
-        self.last_contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
+        self.contact_filt = torch.full((1, 4), -0.5, device=self.model_device, dtype=torch.float32)
+        self.last_contacts = np.zeros(4, dtype=np.bool_)
 
 
     def parse_config(self):
@@ -333,8 +355,24 @@ class UnitreeRos2Real(Node):
         self.actions = torch.zeros(self.NUM_ACTIONS, device= self.model_device, dtype= torch.float32)    
 
         ###################### hardware related #####################
-        self.joint_limits_high = getattr(RobotCfgs, self.robot_class_name).joint_limits_high.to(self.model_device)
-        self.joint_limits_low = getattr(RobotCfgs, self.robot_class_name).joint_limits_low.to(self.model_device)
+        robot_cfg = getattr(RobotCfgs, self.robot_class_name)
+        self.joint_limits_high = robot_cfg.joint_limits_high.to(self.model_device)
+        self.joint_limits_low = robot_cfg.joint_limits_low.to(self.model_device)
+        self.joint_limits_high_np = (
+            self.joint_limits_high.detach().cpu().numpy().astype(np.float64)
+        )
+        self.joint_limits_low_np = (
+            self.joint_limits_low.detach().cpu().numpy().astype(np.float64)
+        )
+        self.torque_limits_np = (
+            robot_cfg.torque_limits.detach().cpu().numpy().astype(np.float64)
+        )
+        self.joint_velocity_limits_np = (
+            robot_cfg.joint_velocity_limits.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
         joint_pos_mid = (self.joint_limits_high + self.joint_limits_low) / 2
         joint_pos_range = (self.joint_limits_high - self.joint_limits_low) / 2
         self.joint_pos_protect_high = joint_pos_mid + joint_pos_range * self.dof_pos_protect_ratio
@@ -467,6 +505,53 @@ class UnitreeRos2Real(Node):
         velocity = self.dof_vel_[0].detach().cpu().numpy().astype(np.float64)
         return position, velocity
 
+    def _current_foot_force(self):
+        if not hasattr(self, "decoded_low_state"):
+            raise RealControlError("decoded LowState is unavailable")
+        return self.decoded_low_state.foot_force.copy()
+
+    def _current_motor_diagnostics(self):
+        temperatures = np.asarray(
+            [
+                self.low_state_buffer.motor_state[self.dof_map[index]].temperature
+                for index in range(self.NUM_DOF)
+            ],
+            dtype=np.float64,
+        )
+        lost = np.asarray(
+            [
+                self.low_state_buffer.motor_state[self.dof_map[index]].lost
+                for index in range(self.NUM_DOF)
+            ],
+            dtype=np.float64,
+        )
+        return temperatures, lost
+
+    def _current_roll_pitch(self):
+        return self._get_imu_obs()[0].detach().cpu().numpy().astype(np.float64)
+
+    def _validate_policy_entry_now(self):
+        if self.last_command_target_q is None:
+            raise RealControlError("stand target is unavailable")
+        position, _ = self._current_joint_state()
+        roll, pitch = self._current_roll_pitch()
+        temperatures, lost = self._current_motor_diagnostics()
+        if self.policy_lost_baseline is None:
+            self.policy_lost_baseline = lost.copy()
+        try:
+            validate_policy_entry_state(
+                self._current_foot_force(),
+                roll,
+                pitch,
+                position,
+                self.last_command_target_q,
+                temperatures,
+                lost,
+                self.policy_lost_baseline,
+            )
+        finally:
+            self.policy_lost_baseline = lost.copy()
+
     def _validate_takeover_now(self, now):
         if self.latest_low_state_time is None or self.latest_remote_time is None:
             raise RealControlError("LowState and remote input are required")
@@ -500,11 +585,16 @@ class UnitreeRos2Real(Node):
         )
         self.policy_prime_gate = PolicyPrimeGate(now)
         self.policy_prime_cycle = 0
+        self.last_contacts = np.zeros(4, dtype=np.bool_)
+        self.contact_filt.fill_(-0.5)
 
     def begin_policy_prime(self, now=None):
         """Hold stand while rebuilding current proprioception and visual state."""
         timestamp = time.monotonic() if now is None else float(now)
         self.policy_transition.reset()
+        self.policy_prime_rejection_reason = None
+        _, lost = self._current_motor_diagnostics()
+        self.policy_lost_baseline = lost.copy()
         self._reset_policy_prime_memory(timestamp)
         self.real_control_phase = "policy_prime"
         self.get_logger().warning(
@@ -514,6 +604,7 @@ class UnitreeRos2Real(Node):
 
     def restart_policy_prime(self, now, reason):
         """Discard partial prime state after any stale input sample."""
+        rejection_reason = str(reason)
         had_samples = (
             self.policy_prime_gate is not None
             and self.policy_prime_gate.has_samples
@@ -523,22 +614,44 @@ class UnitreeRos2Real(Node):
         else:
             self.policy_prime_gate.restart(float(now))
             self.policy_prime_cycle = 0
-        if had_samples:
-            self.get_logger().warning(f"Policy prime restarted: {reason}")
+        if rejection_reason != self.policy_prime_rejection_reason:
+            self.get_logger().warning(
+                f"Policy prime waiting for a safe state: {rejection_reason}"
+            )
+            self.policy_prime_rejection_reason = rejection_reason
 
     def validate_policy_prime_now(self, now):
         if (
             self.latest_low_state_time is None
-            or self.latest_remote_time is None
             or self.latest_depth_time is None
         ):
             raise RealControlError(
-                "LowState, remote input, and depth are required for policy prime"
+                "LowState and depth are required for policy prime"
             )
         validate_policy_prime_inputs(
             now - self.latest_low_state_time,
-            now - self.latest_remote_time,
             now - self.latest_depth_time,
+        )
+        self._validate_policy_entry_now()
+        self.policy_prime_rejection_reason = None
+
+    def validate_policy_runtime_now(self, now):
+        """Validate every sensor sample consumed by an active policy cycle."""
+        if self.latest_low_state_time is None:
+            raise LowStateStaleError(
+                "LowState is unavailable during policy control"
+            )
+        if self.latest_depth_time is None:
+            raise DepthStaleError("depth is unavailable during policy control")
+        position, velocity = self._current_joint_state()
+        validate_policy_runtime_inputs(
+            now - self.latest_low_state_time,
+            now - self.latest_depth_time,
+            position,
+            velocity,
+            self.joint_limits_low_np,
+            self.joint_limits_high_np,
+            self.joint_velocity_limits_np,
         )
 
     def record_policy_prime_sample(self, now, *, depth=False):
@@ -674,9 +787,18 @@ class UnitreeRos2Real(Node):
                 "Policy request ignored until policy context priming completes."
             )
             return False
+        try:
+            if self.latest_remote_time is None:
+                raise RealControlError("remote input is required when Y is pressed")
+            validate_policy_request_input(
+                time.monotonic() - self.latest_remote_time
+            )
+            self.validate_policy_prime_now(time.monotonic())
+        except RealControlError as error:
+            self.get_logger().warning(f"Policy request rejected: {error}")
+            self.begin_policy_prime()
+            return False
         start = self.last_command_target_q
-        if start is None:
-            raise RealControlError("stand target is unavailable")
         self.policy_transition.begin(start, time.monotonic())
         self.real_control_phase = "policy"
         return True
@@ -698,13 +820,37 @@ class UnitreeRos2Real(Node):
         self.low_state_buffer = msg # keep the latest low state
         self.latest_low_state_time = time.monotonic()
 
-        ################### refresh dof_pos and dof_vel ######################
-        for sim_idx in range(self.NUM_DOF):
-            real_idx = self.dof_map[sim_idx]
-            self.dof_pos_[0, sim_idx] = self.low_state_buffer.motor_state[real_idx].q * self.dof_signs[sim_idx]
-        for sim_idx in range(self.NUM_DOF):
-            real_idx = self.dof_map[sim_idx]
-            self.dof_vel_[0, sim_idx] = self.low_state_buffer.motor_state[real_idx].dq * self.dof_signs[sim_idx]
+        boundary_state = BoundaryLowState(
+            motor_q=[
+                self.low_state_buffer.motor_state[index].q
+                for index in range(self.NUM_DOF)
+            ],
+            motor_dq=[
+                self.low_state_buffer.motor_state[index].dq
+                for index in range(self.NUM_DOF)
+            ],
+            foot_force=[
+                self.low_state_buffer.foot_force[index]
+                for index in range(4)
+            ],
+            gyroscope=self.low_state_buffer.imu_state.gyroscope,
+            imu_quaternion_wxyz=self.low_state_buffer.imu_state.quaternion,
+        )
+        self.decoded_low_state = decode_low_state(boundary_state)
+        self.dof_pos_[0].copy_(
+            torch.as_tensor(
+                self.decoded_low_state.joint_q,
+                device=self.model_device,
+                dtype=torch.float32,
+            )
+        )
+        self.dof_vel_[0].copy_(
+            torch.as_tensor(
+                self.decoded_low_state.joint_dq,
+                device=self.model_device,
+                dtype=torch.float32,
+            )
+        )
 
     def _joy_stick_callback(self, msg):
         # self.get_logger().warn("Wireless controller message received.")
@@ -836,19 +982,23 @@ class UnitreeRos2Real(Node):
     """ refresh observation buffer and corresponding sub-functions """
     
     def _get_ang_vel_obs(self):
-        ang_vel = torch.from_numpy(self.low_state_buffer.imu_state.gyroscope).unsqueeze(0).to(device=self.model_device, dtype=torch.float32)
+        if not hasattr(self, "decoded_low_state"):
+            raise RealControlError("decoded LowState is unavailable")
+        ang_vel = torch.as_tensor(
+            self.decoded_low_state.gyroscope,
+            device=self.model_device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
         return ang_vel * self.cfg["normalization"]["obs_scales"]["ang_vel"]
     
     def _get_imu_obs(self):
-        quat_xyzw = torch.tensor([
-            self.low_state_buffer.imu_state.quaternion[1],
-            self.low_state_buffer.imu_state.quaternion[2],
-            self.low_state_buffer.imu_state.quaternion[3],
-            self.low_state_buffer.imu_state.quaternion[0],
-            ], device= self.model_device, dtype= torch.float32).unsqueeze(0)
-        roll, pitch, yaw = get_euler_xyz(quat_xyzw)
-        imu_obs = torch.tensor([[roll, pitch]], device= self.model_device, dtype= torch.float32)
-        return imu_obs
+        if not hasattr(self, "decoded_low_state"):
+            raise RealControlError("decoded LowState is unavailable")
+        return torch.as_tensor(
+            self.decoded_low_state.roll_pitch,
+            device=self.model_device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
 
     def _get_delta_yaw_obs(self):
         yaw = 0
@@ -875,11 +1025,15 @@ class UnitreeRos2Real(Node):
         return self.actions
 
     def _get_contact_filt_obs(self):
-        for sim_idx, real_idx in enumerate(FOOT_REAL_TO_SIM):
-            if self.low_state_buffer.foot_force[real_idx] < 25:
-                self.contact_filt[:, sim_idx] = -0.5
-            else:
-                self.contact_filt[:, sim_idx] = 0.5
+        filtered, current = filter_foot_contacts(
+            self._current_foot_force(),
+            self.last_contacts,
+        )
+        values = np.where(filtered, 0.5, -0.5).astype(np.float32)
+        self.contact_filt.copy_(
+            torch.as_tensor(values, device=self.model_device).unsqueeze(0)
+        )
+        self.last_contacts = current
         return self.contact_filt
 
     def _get_depth_image(self):
@@ -893,59 +1047,37 @@ class UnitreeRos2Real(Node):
         """ Observation segment is defined as a list of lists/ints defining the tensor shape with
         corresponding order.
         """
-        start_time = time.monotonic()
-
-        ang_vel = self._get_ang_vel_obs()  # (1, 3)
-        ang_vel_time = time.monotonic()
-
-        imu = self._get_imu_obs()  # (1, 2)
-        imu_time = time.monotonic()
-
-        yaw_info = self._get_delta_yaw_obs()  # (1, 3)
-        yaw_time = time.monotonic()
-
-        commands = self._get_commands_obs()  # (1, 3)
-        commands_time = time.monotonic()
-
-        if self.mode == "parkour":
-            parkour_walk = torch.tensor([[1, 0]], device= self.model_device, dtype= torch.float32) # parkour
-        elif self.mode == "walk":
-            parkour_walk = torch.tensor([[0, 1]], device= self.model_device, dtype= torch.float32) # walk
-
-        dof_pos = self._get_dof_pos_obs()  # (1, 12)
-        dof_pos_time = time.monotonic()
-
-        dof_vel = self._get_dof_vel_obs()  # (1, 12)
-        dof_vel_time = time.monotonic()
-
-        last_actions = self._get_last_actions_obs().view(1, -1)  # (1, 12)
-        last_action_time = time.monotonic()
-
-        contact = self._get_contact_filt_obs()  # (1, 4)
-        contact_time = time.monotonic()
-        
-        proprio = torch.cat([ang_vel, imu, yaw_info, commands, parkour_walk,
-                        dof_pos, dof_vel,
-                        last_actions, 
-                        contact], dim=-1)
+        if not hasattr(self, "decoded_low_state"):
+            raise RealControlError("decoded LowState is unavailable")
+        command_forward = (
+            float(self.xyyaw_command[0, 0])
+            if self.move_by_wireless_remote
+            else 0.0
+        )
+        proprio_values, current_contacts = build_policy_proprio(
+            self.decoded_low_state,
+            self.default_dof_pos_np,
+            self.actions.detach().cpu().numpy(),
+            self.last_contacts,
+            command_forward,
+            float(self.cfg["normalization"]["obs_scales"]["ang_vel"]),
+            float(self.cfg["normalization"]["obs_scales"]["dof_pos"]),
+            float(self.cfg["normalization"]["obs_scales"]["dof_vel"]),
+            self.mode,
+        )
+        proprio = torch.as_tensor(
+            proprio_values,
+            device=self.model_device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        self.contact_filt.copy_(proprio[:, -4:])
+        self.last_contacts = current_contacts
 
         self.proprio_history_buf = update_proprio_history(
             self.proprio_history_buf,
             proprio,
             self.episode_length_buf,
         )
-        end_time = time.monotonic()
-
-        # print('ang vel time: {:.5f}'.format(ang_vel_time - start_time),
-        #         'imu time: {:.5f}'.format(imu_time - ang_vel_time),
-        #         'yaw time: {:.5f}'.format(yaw_time - imu_time),
-        #         'command time: {:.5f}'.format(commands_time - yaw_time),
-        #         'dof pos time: {:.5f}'.format(dof_pos_time - commands_time),
-        #         'dof vel time: {:.5f}'.format(dof_vel_time - dof_pos_time),
-        #         'last action time: {:.5f}'.format(last_action_time - dof_vel_time),
-        #         'contact time: {:.5f}'.format(contact_time - last_action_time)
-        #         )
-        
         self.episode_length_buf += 1
 
         return proprio
@@ -971,41 +1103,53 @@ class UnitreeRos2Real(Node):
         if raw_action.shape == (1, self.NUM_ACTIONS):
             raw_action = raw_action[0]
         action_scale = float(self.cfg["control"]["action_scale"])
-        clipped_action, requested_target = prepare_policy_action(
+        observed_action, _, requested_target = prepare_policy_action(
             raw_action,
             self.default_dof_pos_np,
             float(self.cfg["normalization"]["clip_actions"]),
             action_scale,
         )
+        self.actions = torch.as_tensor(
+            observed_action,
+            dtype=torch.float32,
+            device=self.model_device,
+        )
 
         engagement_active = self.policy_transition.active
         if engagement_active:
-            commanded_target = self.policy_transition.apply(
+            transition_target = self.policy_transition.apply(
                 requested_target,
                 time.monotonic(),
             )
-            observed_action = executed_target_to_action(
-                commanded_target,
-                self.default_dof_pos_np,
-                action_scale,
-            )
-            self.actions = torch.as_tensor(
-                observed_action,
-                dtype=torch.float32,
-                device=self.model_device,
-            )
+        else:
+            transition_target = requested_target
+
+        if self.last_command_target_q is None:
+            raise RealControlError("previous joint target is unavailable")
+        measured_q, measured_dq = self._current_joint_state()
+        commanded_target = constrain_policy_target(
+            transition_target,
+            self.last_command_target_q,
+            measured_q,
+            measured_dq,
+            self.p_gains_np,
+            self.d_gains_np,
+            self.joint_limits_low_np,
+            self.joint_limits_high_np,
+            self.torque_limits_np,
+            max_step_rad=(
+                self.policy_transition.max_step_rad
+                if engagement_active
+                else POLICY_TARGET_MAX_STEP_RAD
+            ),
+        )
+        if engagement_active:
+            self.policy_transition.record_executed_target(commanded_target)
             if not self.policy_transition.active:
                 self.get_logger().warning(
-                    "Policy engagement complete; clipped policy targets now "
-                    "pass through without engagement limiting."
+                    "Policy engagement complete; continuous policy target "
+                    "constraints remain active."
                 )
-        else:
-            commanded_target = requested_target
-            self.actions = torch.as_tensor(
-                clipped_action,
-                dtype=torch.float32,
-                device=self.model_device,
-            )
 
         self._publish_legs_cmd(commanded_target, stand=False)
         return {
@@ -1125,7 +1269,7 @@ class UnitreeRos2Real(Node):
     """ functions that actually publish the commands and take effect """
     def _publish_legs_cmd(self, robot_coordinates_action, stand):
         """ Publish the joint commands to the robot legs in robot coordinates system.
-        robot_coordinates_action: shape (NUM_DOF,), in simulation order.
+        robot_coordinates_action: shape (NUM_DOF,), in actor/Unitree order.
         """
         if self.low_cmd_pub is None or self.low_cmd_buffer is None:
             raise RealControlError("/lowcmd publisher is not initialized")
@@ -1142,19 +1286,26 @@ class UnitreeRos2Real(Node):
         if target.shape != (12,) or not np.isfinite(target).all():
             raise RealControlError("joint command must contain 12 finite values")
 
-        #################### check ##############################
-        for sim_idx in range(self.NUM_DOF):
-            real_idx = self.dof_map[sim_idx]
+        encoded = encode_low_cmd(target, self.p_gains_np, self.d_gains_np)
+        for real_idx in range(self.NUM_DOF):
             if not self.dryrun:
-                self.low_cmd_buffer.motor_cmd[real_idx].mode = self.turn_on_motor_mode[sim_idx]
-            self.low_cmd_buffer.motor_cmd[real_idx].q = float(target[sim_idx]) * self.dof_signs[sim_idx]
-            self.low_cmd_buffer.motor_cmd[real_idx].dq = 0.
-            self.low_cmd_buffer.motor_cmd[real_idx].tau = 0.
+                self.low_cmd_buffer.motor_cmd[real_idx].mode = (
+                    self.turn_on_motor_mode[real_idx]
+                )
+            self.low_cmd_buffer.motor_cmd[real_idx].q = float(
+                encoded.motor_q[real_idx]
+            )
+            self.low_cmd_buffer.motor_cmd[real_idx].dq = float(
+                encoded.motor_dq[real_idx]
+            )
+            self.low_cmd_buffer.motor_cmd[real_idx].tau = float(
+                encoded.motor_tau[real_idx]
+            )
             self.low_cmd_buffer.motor_cmd[real_idx].kp = float(
-                self.p_gains_np[sim_idx]
+                encoded.motor_kp[real_idx]
             )
             self.low_cmd_buffer.motor_cmd[real_idx].kd = float(
-                self.d_gains_np[sim_idx]
+                encoded.motor_kd[real_idx]
             )
         
         self.low_cmd_buffer.crc = get_crc(self.low_cmd_buffer)

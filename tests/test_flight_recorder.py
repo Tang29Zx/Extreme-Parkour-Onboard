@@ -21,6 +21,10 @@ class FlightRecorderTest(unittest.TestCase):
             measured_dq=values * 0.01,
             imu_quaternion=(1.0, 0.0, 0.0, 0.0),
             foot_force=(10.0, 20.0, 30.0, 40.0),
+            contact_state=(1.0, 1.0, 1.0, 1.0),
+            motor_temperature=np.full(12, 45.0),
+            motor_lost=np.zeros(12),
+            motor_tau_est=values * 0.02,
             input_ages=(0.01, 0.02, 0.03),
             loop_s=0.02,
         )
@@ -53,6 +57,11 @@ class FlightRecorderTest(unittest.TestCase):
                     np.asarray([101.0, 102.0]),
                 )
                 self.assertEqual(data["raw_action"].shape, (2, 12))
+                self.assertEqual(data["motor_temperature"].shape, (2, 12))
+                self.assertEqual(data["motor_lost"].shape, (2, 12))
+                self.assertEqual(data["motor_tau_est"].shape, (2, 12))
+                self.assertEqual(data["contact_state"].shape, (2, 4))
+                self.assertEqual(data["format_version"].tolist(), [2])
                 self.assertEqual(data["visual_output"].shape, (1, 34))
                 self.assertEqual(data["reason"].tolist(), ["unit_test"])
                 self.assertEqual(data["visual_timestamp"].tolist(), [101.0])
@@ -85,6 +94,7 @@ class FlightRecorderTest(unittest.TestCase):
                 self.assertEqual(data["raw_action"].shape, (0, 12))
                 self.assertEqual(data["imu_quaternion"].shape, (0, 4))
                 self.assertEqual(data["input_ages"].shape, (0, 3))
+                self.assertEqual(data["motor_temperature"].shape, (0, 12))
 
 
 if __name__ == "__main__":

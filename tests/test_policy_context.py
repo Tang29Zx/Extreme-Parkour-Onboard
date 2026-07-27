@@ -20,7 +20,11 @@ class PolicyContextTest(unittest.TestCase):
         result = update_proprio_history(history, proprio, torch.tensor([2.0]))
 
         torch.testing.assert_close(result[:, :-1], history[:, 1:])
-        torch.testing.assert_close(result[:, -1], proprio)
+        torch.testing.assert_close(
+            result[:, -1],
+            proprio,
+            check_stride=False,
+        )
 
     def test_reset_clears_buffers_and_resets_depth_once(self):
         actions = torch.ones(12)

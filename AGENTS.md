@@ -22,6 +22,10 @@
 - 策略上下文：`python -m unittest tests.test_policy_context -v`
 - 飞行记录：`python -m unittest tests.test_flight_recorder -v`
 - 关节边界：`python -m unittest tests.test_joint_mapping -v`
+- Unitree消息边界：`python -m unittest tests.test_unitree_boundary -v`
+- 回放几何：`python -m unittest tests.test_replay_traced -v`
+- Unitree边界S2S：使用README中的Isaac Gym环境命令，先运行`fixed/full --headless`
+  1000步；验收失败必须保留NPZ和非零退出状态。
 - Jetson环境：`bash scripts/setup_jetson.sh`（仅在Jetson上执行）
 - Diff：`git diff --check`
 

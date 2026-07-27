@@ -12,7 +12,12 @@ from torch import nn
 
 from flight_recorder import FlightRecorder
 from joint_mapping import FOOT_REAL_TO_SIM
-from real_control_safety import RealControlError
+from real_control_safety import (
+    LowStateStaleError,
+    PolicyTargetInfeasibleError,
+    RealControlError,
+    classify_foot_contacts,
+)
 from rsl_rl.modules import RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
 
 from sport_api_constants import *
@@ -107,18 +112,20 @@ class Go2Node(UnitreeRos2Real):
 
     def _record_control(self, command, loop_started):
         now = time.monotonic()
+        motor_states = [
+            self.low_state_buffer.motor_state[self.dof_map[index]]
+            for index in range(self.NUM_DOF)
+        ]
         position = np.asarray(
             [
-                self.low_state_buffer.motor_state[self.dof_map[index]].q
-                * self.dof_signs[index]
+                motor_states[index].q * self.dof_signs[index]
                 for index in range(self.NUM_DOF)
             ],
             dtype=np.float64,
         )
         velocity = np.asarray(
             [
-                self.low_state_buffer.motor_state[self.dof_map[index]].dq
-                * self.dof_signs[index]
+                motor_states[index].dq * self.dof_signs[index]
                 for index in range(self.NUM_DOF)
             ],
             dtype=np.float64,
@@ -131,6 +138,12 @@ class Go2Node(UnitreeRos2Real):
         foot_force = [
             self.low_state_buffer.foot_force[index]
             for index in FOOT_REAL_TO_SIM
+        ]
+        motor_temperature = [state.temperature for state in motor_states]
+        motor_lost = [state.lost for state in motor_states]
+        motor_tau_est = [
+            motor_states[index].tau_est * self.dof_signs[index]
+            for index in range(self.NUM_DOF)
         ]
         try:
             self.flight_recorder.record_control(
@@ -145,6 +158,10 @@ class Go2Node(UnitreeRos2Real):
                 measured_dq=velocity,
                 imu_quaternion=self.low_state_buffer.imu_state.quaternion,
                 foot_force=foot_force,
+                contact_state=classify_foot_contacts(foot_force),
+                motor_temperature=motor_temperature,
+                motor_lost=motor_lost,
+                motor_tau_est=motor_tau_est,
                 input_ages=input_ages,
                 loop_s=now - loop_started,
             )
@@ -162,6 +179,41 @@ class Go2Node(UnitreeRos2Real):
         if path is not None:
             self.get_logger().warning(f"Flight record saved: {path}")
         return path
+
+    def _emergency_stop(self, reason):
+        self.get_logger().error(
+            f"Emergency stop ({reason}): publishing the motor-off tail."
+        )
+        self.policy_transition.reset()
+        self.shutdown_outputs()
+        self.flush_flight_record(reason)
+        self.real_control_phase = "emergency_stop"
+        self.use_stand_policy = False
+        self.use_parkour_policy = False
+        self.use_sport_mode = False
+
+    def _handle_policy_fault(self, error):
+        """Leave policy control without issuing the rejected target."""
+        if isinstance(
+            error,
+            (LowStateStaleError, PolicyTargetInfeasibleError),
+        ):
+            reason = (
+                "policy_low_state_stale"
+                if isinstance(error, LowStateStaleError)
+                else "policy_target_infeasible"
+            )
+            self._emergency_stop(reason)
+            return
+        self.get_logger().error(
+            f"Policy guard rejected the control cycle: {error}. "
+            "Returning to stand through the recovery ramp."
+        )
+        self.pending_flight_reason = "policy_guard_recovery"
+        self.begin_stand_recovery()
+        self.use_stand_policy = True
+        self.use_parkour_policy = False
+        self.use_sport_mode = False
 
     def start_main_loop_timer(self, duration):
         self.main_loop_timer = self.create_timer(
@@ -182,16 +234,7 @@ class Go2Node(UnitreeRos2Real):
             and self.real_control_phase not in ("sport", "dryrun")
             and r2_pressed
         ):
-            self.get_logger().error(
-                "R2 emergency stop: publishing the motor-off tail."
-            )
-            self.policy_transition.reset()
-            self.shutdown_outputs()
-            self.flush_flight_record("r2_emergency_stop")
-            self.real_control_phase = "emergency_stop"
-            self.use_stand_policy = False
-            self.use_parkour_policy = False
-            self.use_sport_mode = False
+            self._emergency_stop("r2_emergency_stop")
             return
 
         if self.use_sport_mode:
@@ -245,26 +288,39 @@ class Go2Node(UnitreeRos2Real):
         if self.use_parkour_policy:
             self.use_stand_policy = False
             self.use_sport_mode = False
-            
             loop_started = time.monotonic()
+            try:
+                self.validate_policy_runtime_now(loop_started)
+                proprio = self.get_proprio()
+                proprio_history = self._get_history_proprio()
 
-            proprio = self.get_proprio()
-            proprio_history = self._get_history_proprio()
-
-            if self.global_counter % self.visual_update_interval == 0:
-                depth_image = self._get_depth_image()
-                if self.global_counter == 0:
+                if self.global_counter % self.visual_update_interval == 0:
+                    depth_image = self._get_depth_image()
+                    if self.global_counter == 0:
+                        self.last_depth_image = depth_image
+                    self.depth_latent_yaw = self.depth_encode(
+                        self.last_depth_image,
+                        proprio,
+                    )
+                    self._record_visual_sample(
+                        self.last_depth_image,
+                        self.depth_latent_yaw,
+                    )
                     self.last_depth_image = depth_image
-                self.depth_latent_yaw = self.depth_encode(self.last_depth_image, proprio)
-                self._record_visual_sample(
-                    self.last_depth_image,
-                    self.depth_latent_yaw,
-                )
-                self.last_depth_image = depth_image
 
-            obs = self.turn_obs(proprio, self.depth_latent_yaw, proprio_history, self.n_proprio, self.n_depth_latent, self.n_hist_len)
-            action = self.policy(obs)
-            command = self.send_action(action)
+                obs = self.turn_obs(
+                    proprio,
+                    self.depth_latent_yaw,
+                    proprio_history,
+                    self.n_proprio,
+                    self.n_depth_latent,
+                    self.n_hist_len,
+                )
+                action = self.policy(obs)
+                command = self.send_action(action)
+            except RealControlError as error:
+                self._handle_policy_fault(error)
+                return
             self._record_control(command, loop_started)
             self.global_counter += 1
 

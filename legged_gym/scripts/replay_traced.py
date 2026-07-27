@@ -23,8 +23,36 @@ if "tqdm" not in sys.modules:
     tqdm_module.__spec__ = ModuleSpec("tqdm", loader=None)
     tqdm_module.tqdm = lambda iterable, *args, **kwargs: iterable
     sys.modules["tqdm"] = tqdm_module
+if "pydelatin" not in sys.modules:
+    pydelatin_module = types.ModuleType("pydelatin")
+    pydelatin_module.__spec__ = ModuleSpec("pydelatin", loader=None)
+
+    class _UnavailableDelatin:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("pydelatin is unavailable; use grid meshing")
+
+    pydelatin_module.Delatin = _UnavailableDelatin
+    sys.modules["pydelatin"] = pydelatin_module
+if "pyfqmr" not in sys.modules:
+    pyfqmr_module = types.ModuleType("pyfqmr")
+    pyfqmr_module.__spec__ = ModuleSpec("pyfqmr", loader=None)
+
+    class _UnavailableSimplify:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("pyfqmr is unavailable; disable grid simplification")
+
+    pyfqmr_module.Simplify = _UnavailableSimplify
+    sys.modules["pyfqmr"] = pyfqmr_module
 
 from legged_gym.envs import *  # noqa: F401,F403 -- registers Isaac Gym tasks.
+from legged_gym.scripts.replay_geometry import (
+    BOX_FRONT_M,
+    BOX_HEIGHT_M,
+    BOX_LENGTH_M,
+    BOX_WIDTH_M,
+    TRACK_CENTER_Y_M,
+    single_box_world_bounds,
+)
 from legged_gym.utils import get_args, task_registry
 from legged_gym.utils.terrain import Terrain
 from rsl_rl.modules import DepthOnlyFCBackbone58x87, RecurrentDepthBackbone
@@ -32,11 +60,6 @@ from rsl_rl.modules import DepthOnlyFCBackbone58x87, RecurrentDepthBackbone
 
 FORWARD_COMMAND_MPS = 0.5
 VISUAL_UPDATE_INTERVAL = 5
-BOX_FRONT_M = 2.0
-BOX_LENGTH_M = 1.2
-BOX_WIDTH_M = 1.2
-BOX_HEIGHT_M = 0.2
-TRACK_CENTER_Y_M = 2.0
 
 
 def install_single_box_terrain() -> None:
@@ -93,11 +116,15 @@ def render_single_box_depth(env) -> torch.Tensor:
         - (torch.arange(height, device=device, dtype=torch.float32) + 0.5)
         / height
     ) * vertical_fov
-    row_grid, column_grid = torch.meshgrid(
-        row_angle,
-        column_angle,
-        indexing="ij",
-    )
+    try:
+        row_grid, column_grid = torch.meshgrid(
+            row_angle,
+            column_angle,
+            indexing="ij",
+        )
+    except TypeError:
+        # Torch 1.9 always uses matrix (ij) indexing and has no keyword.
+        row_grid, column_grid = torch.meshgrid(row_angle, column_angle)
 
     rays = torch.stack(
         (
@@ -144,20 +171,7 @@ def render_single_box_depth(env) -> torch.Tensor:
     )
     ground_depth = torch.where(ground_depth >= 0.0, ground_depth, far)
 
-    box_min = torch.tensor(
-        [BOX_FRONT_M, TRACK_CENTER_Y_M - BOX_WIDTH_M / 2.0, 0.0],
-        dtype=torch.float32,
-        device=device,
-    )
-    box_max = torch.tensor(
-        [
-            BOX_FRONT_M + BOX_LENGTH_M,
-            TRACK_CENTER_Y_M + BOX_WIDTH_M / 2.0,
-            BOX_HEIGHT_M,
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
+    box_min, box_max = single_box_world_bounds(env.env_origins)
     safe_direction = torch.where(
         torch.abs(ray_world) < 1e-6,
         torch.full_like(ray_world, 1e-6),
@@ -177,7 +191,11 @@ def render_single_box_depth(env) -> torch.Tensor:
     return metric_depth.reshape(env.num_envs, height, width) / 2.0 - 0.5
 
 
-def configure_replay_environment(env_cfg) -> None:
+def configure_replay_environment(
+    env_cfg,
+    num_envs: int = 1,
+    num_terrain_columns: int = 1,
+) -> None:
     """Create one deterministic flat parkour lane for exported-policy review."""
     resources_dir = Path(
         os.environ.get("PARKOUR_RESOURCES_DIR", "/workspace/parkour-resources")
@@ -187,13 +205,14 @@ def configure_replay_environment(env_cfg) -> None:
         raise FileNotFoundError(f"Go2 URDF was not found at {go2_urdf}")
     env_cfg.asset.file = str(go2_urdf)
 
-    env_cfg.env.num_envs = 1
+    env_cfg.env.num_envs = int(num_envs)
     env_cfg.env.episode_length_s = 60
     env_cfg.env.randomize_start_pos = False
     env_cfg.env.randomize_start_y = False
     env_cfg.env.randomize_start_yaw = False
     env_cfg.env.randomize_start_pitch = False
     env_cfg.env.randomize_start_vel = False
+    env_cfg.env.dof_pos_reset_range = [0.0, 0.0]
 
     env_cfg.commands.curriculum = False
     env_cfg.commands.resampling_time = 60
@@ -221,7 +240,7 @@ def configure_replay_environment(env_cfg) -> None:
     env_cfg.terrain.max_difficulty = False
     env_cfg.terrain.max_init_terrain_level = 0
     env_cfg.terrain.num_rows = 2
-    env_cfg.terrain.num_cols = 1
+    env_cfg.terrain.num_cols = int(num_terrain_columns)
     env_cfg.terrain.num_goals = 3
     env_cfg.terrain.height = [0.0, 0.0]
     env_cfg.terrain.horizontal_scale = 0.1
@@ -244,11 +263,19 @@ def load_exported_models(traced_dir: Path, device: torch.device):
     )
     base_model.eval()
 
-    vision_state = torch.load(
-        str(traced_dir / "vision_weight.pt"),
-        map_location=device,
-        weights_only=True,
-    )
+    try:
+        vision_state = torch.load(
+            str(traced_dir / "vision_weight.pt"),
+            map_location=device,
+            weights_only=True,
+        )
+    except TypeError:
+        # The Jetson-compatible Python 3.8 environment uses Torch 1.9, which
+        # predates weights_only. The file is a trusted local traced asset.
+        vision_state = torch.load(
+            str(traced_dir / "vision_weight.pt"),
+            map_location=device,
+        )
     depth_backbone = DepthOnlyFCBackbone58x87(None, 32, 512)
     depth_encoder = RecurrentDepthBackbone(depth_backbone, None).to(device)
     depth_encoder.load_state_dict(vision_state["depth_encoder_state_dict"])

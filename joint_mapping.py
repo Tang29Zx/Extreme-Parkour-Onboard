@@ -5,7 +5,7 @@ from typing import Sequence, Tuple
 
 NUM_DOF = 12
 
-SIM_DOF_NAMES = (
+ISAAC_DOF_NAMES = (
     "FL_hip_joint",
     "FL_thigh_joint",
     "FL_calf_joint",
@@ -20,12 +20,28 @@ SIM_DOF_NAMES = (
     "RR_calf_joint",
 )
 
-# Index by policy/simulation joint; value is the matching Unitree motor index.
-SIM_TO_REAL_DOF = (3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8)
+# Training reindexes Isaac Gym vectors before they cross the actor boundary.
+ISAAC_TO_POLICY_DOF = (3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8)
+POLICY_DOF_NAMES = tuple(ISAAC_DOF_NAMES[index] for index in ISAAC_TO_POLICY_DOF)
+POLICY_TO_ISAAC_DOF = tuple(
+    ISAAC_TO_POLICY_DOF.index(index) for index in range(NUM_DOF)
+)
+
+# Unitree motor state and LowCmd use the same FR/FL/RR/RL order as the actor.
+POLICY_TO_REAL_DOF = tuple(range(NUM_DOF))
 DOF_SIGNS = (1.0,) * NUM_DOF
 
-# Unitree foot order FR/FL/RR/RL -> policy order FL/FR/RL/RR.
-FOOT_REAL_TO_SIM = (1, 0, 3, 2)
+# Unitree foot force and actor contact use the same FR/FL/RR/RL order.
+FOOT_REAL_TO_POLICY = tuple(range(4))
+ISAAC_TO_UNITREE_FOOT = (1, 0, 3, 2)
+UNITREE_TO_ISAAC_FOOT = tuple(
+    ISAAC_TO_UNITREE_FOOT.index(index) for index in range(4)
+)
+
+# Backwards-compatible names used by the current control code.
+SIM_DOF_NAMES = POLICY_DOF_NAMES
+SIM_TO_REAL_DOF = POLICY_TO_REAL_DOF
+FOOT_REAL_TO_SIM = FOOT_REAL_TO_POLICY
 
 
 def _vector(values: Sequence[float], size: int, name: str) -> Tuple[float, ...]:
@@ -35,8 +51,8 @@ def _vector(values: Sequence[float], size: int, name: str) -> Tuple[float, ...]:
 
 
 def sim_to_real(values: Sequence[float]) -> Tuple[float, ...]:
-    """Convert a policy-order joint vector to Unitree motor order."""
-    simulation = _vector(values, NUM_DOF, "simulation joint vector")
+    """Convert an actor-order joint vector to Unitree motor order."""
+    simulation = _vector(values, NUM_DOF, "policy joint vector")
     real = [0.0] * NUM_DOF
     for sim_index, real_index in enumerate(SIM_TO_REAL_DOF):
         real[real_index] = simulation[sim_index] * DOF_SIGNS[sim_index]
@@ -44,7 +60,7 @@ def sim_to_real(values: Sequence[float]) -> Tuple[float, ...]:
 
 
 def real_to_sim(values: Sequence[float]) -> Tuple[float, ...]:
-    """Convert a Unitree motor-order joint vector to policy order."""
+    """Convert a Unitree motor-order joint vector to actor order."""
     real = _vector(values, NUM_DOF, "Unitree joint vector")
     return tuple(
         real[real_index] * DOF_SIGNS[sim_index]
@@ -53,6 +69,30 @@ def real_to_sim(values: Sequence[float]) -> Tuple[float, ...]:
 
 
 def foot_real_to_sim(values: Sequence[float]) -> Tuple[float, ...]:
-    """Convert Unitree FR/FL/RR/RL foot values to FL/FR/RL/RR."""
+    """Convert Unitree FR/FL/RR/RL foot values to actor order."""
     real = _vector(values, 4, "Unitree foot vector")
     return tuple(real[index] for index in FOOT_REAL_TO_SIM)
+
+
+def isaac_to_policy(values: Sequence[float]) -> Tuple[float, ...]:
+    """Convert an Isaac FL/FR/RL/RR joint vector to actor order."""
+    isaac = _vector(values, NUM_DOF, "Isaac joint vector")
+    return tuple(isaac[index] for index in ISAAC_TO_POLICY_DOF)
+
+
+def policy_to_isaac(values: Sequence[float]) -> Tuple[float, ...]:
+    """Convert an actor-order joint vector to Isaac FL/FR/RL/RR order."""
+    policy = _vector(values, NUM_DOF, "policy joint vector")
+    return tuple(policy[index] for index in POLICY_TO_ISAAC_DOF)
+
+
+def isaac_feet_to_unitree(values: Sequence[float]) -> Tuple[float, ...]:
+    """Convert Isaac FL/FR/RL/RR foot values to Unitree FR/FL/RR/RL."""
+    isaac = _vector(values, 4, "Isaac foot vector")
+    return tuple(isaac[index] for index in ISAAC_TO_UNITREE_FOOT)
+
+
+def unitree_feet_to_isaac(values: Sequence[float]) -> Tuple[float, ...]:
+    """Convert Unitree FR/FL/RR/RL foot values to Isaac FL/FR/RL/RR."""
+    unitree = _vector(values, 4, "Unitree foot vector")
+    return tuple(unitree[index] for index in UNITREE_TO_ISAAC_FOOT)
