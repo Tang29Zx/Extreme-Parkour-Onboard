@@ -61,23 +61,52 @@ uint16 (240, 424)
 Sport Mode + model warm-up
 -> L1 release/hold gate
 -> CheckMode
+-> latch fresh measured joint pose
+-> create own /lowcmd publisher (publishing still blocked)
 -> ReleaseMode (only when active)
 -> CheckMode verification
--> external /lowcmd publishers == 0 for 0.5 s
--> create own /lowcmd publisher
--> 3 s measured-pose startup ramp
+-> authorize real LowCmd publishing
+-> publish latched-pose hold immediately
+-> 3 s latched-pose startup ramp
+-> policy_prime: 0.5 s, >=10 proprio frames, >=5 depth-GRU frames
 -> stand_hold
 -> Y rising edge
--> 1 s policy engagement ramp + 0.05 rad/cycle slew limit
--> policy
+-> policy_engagement: 1 s quintic blend, <=0.05 rad/cycle
+-> policy (upstream target passthrough after target convergence)
 ```
 
-MotionSwitcher RPC每次2秒超时，最多3次。任何RPC、输入新鲜度或publisher
-独占检查失败时，在创建真实`/lowcmd` publisher前终止进程。
+MotionSwitcher RPC每次2秒超时，最多3次。publisher对象可以在ReleaseMode前创建，
+但真实发布授权只在CheckMode确认为空后打开。任何RPC或输入新鲜度检查失败时，
+预创建publisher不得发送保持命令或退出motor-off。原生publisher endpoint可能因DDS
+发现缓存继续显示数秒，该endpoint存在本身不再阻塞接管。
 
-2026-07-27静态验证：9个真实接管纯函数测试、3个输出路由测试和8个
-深度处理测试全部通过；两个控制入口通过Python 3.8语法检查。尚未
-在Jetson ROS图上执行MotionSwitcher或创建真实`/lowcmd` publisher。
+`policy_prime`开始时清零上一动作和episode历史、重置视觉GRU hidden state，并在
+默认站姿下重新采样。任一输入年龄超过0.25秒时清空本轮样本并重新预热。L2恢复完成
+后走同一预热路径。接入保护以最后站姿目标为起点；保护期间的`last_actions`由实际
+下发目标反算，追平策略请求后才切换为裁剪后策略动作。
+
+策略动作边界统一执行以下顺序：
+
+```text
+raw_action (12 finite values)
+-> clamp to [-normalization.clip_actions, +normalization.clip_actions]
+-> target_q = default_q - clipped_action * control.action_scale
+-> policy engagement blend/slew guard
+-> LowCmd joint mapping
+```
+
+`self.actions`在稳态保存`clipped_action`。接入保护改变最终目标时，使用
+`(default_q - commanded_q) / action_scale`反算实际动作，以保证当前观测和10帧历史
+都只包含实际执行语义。纯函数测试覆盖`±1.2`动作上限、`±0.3 rad`残差上限、减号映射
+往返和非法输入拒绝。
+
+运行时使用250周期控制环形缓冲和50帧视觉环形缓冲，不在控制循环写磁盘或打印完整
+tensor。L2、R2、异常和退出时将原始/实际动作、请求/下发/实测关节状态、IMU、足端力、
+输入年龄、视觉统计和循环耗时写入`--flight-log-dir`下的时间戳NPZ。
+
+2026-07-27静态验证：34个深度、映射、输出隔离、上下文、接入保护和飞行记录测试
+通过；相关文件通过Python 3.8语法检查和`git diff --check`。新policy prime、Y接入
+保护、飞行记录和控制循环p95尚未在Jetson dry-run或真机上验收。
 
 ## model_38300关节与接触边界
 

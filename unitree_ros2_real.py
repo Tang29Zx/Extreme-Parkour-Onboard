@@ -20,6 +20,7 @@ from joint_mapping import (
     SIM_TO_REAL_DOF,
 )
 from output_routing import resolve_output_topics
+from policy_context import reset_policy_context, update_proprio_history
 from real_control_safety import (
     CHECK_MODE_API_ID,
     MOTION_REQUEST_TOPIC,
@@ -30,15 +31,17 @@ from real_control_safety import (
     RPC_TIMEOUT_S,
     STARTUP_RAMP_S,
     TAKEOVER_HOLD_S,
+    PolicyPrimeGate,
     PolicyTransitionGuard,
-    PublisherClearGate,
     RealControlError,
     build_motion_request,
-    describe_publisher_endpoint,
+    executed_target_to_action,
     interpolate_pose,
     parse_motion_response,
+    prepare_policy_action,
     release_mode_required,
-    validate_low_command_boundary,
+    validate_policy_prime_inputs,
+    validate_real_low_command_publish,
     validate_takeover_inputs,
 )
 
@@ -175,6 +178,7 @@ class UnitreeRos2Real(Node):
         self.sport_mode_pub = None
         self.low_cmd_pub = None
         self.low_cmd_buffer = None
+        self.real_lowcmd_authorized = False
         self.motion_request_pub = None
         self.motion_responses = []
         self.latest_low_state_time = None
@@ -188,6 +192,9 @@ class UnitreeRos2Real(Node):
         self.stand_recovery_start_time = None
         self.stand_recovery_start_q = None
         self.last_command_target_q = None
+        self.policy_prime_gate = None
+        self.policy_prime_cycle = 0
+        self.policy_depth_reset = None
         self.policy_transition = PolicyTransitionGuard()
         self.joy_stick_topic = joy_stick_topic
         self.depth_data_topic = depth_data_topic
@@ -280,6 +287,9 @@ class UnitreeRos2Real(Node):
                     self.p_gains.append(v)
                     break 
         self.p_gains = torch.tensor(self.p_gains, device= self.model_device, dtype= torch.float32)
+        self.p_gains_np = (
+            self.p_gains.detach().cpu().numpy().astype(np.float64)
+        )
 
         self.d_gains = []
         for i in range(self.NUM_DOF):
@@ -289,6 +299,9 @@ class UnitreeRos2Real(Node):
                     self.d_gains.append(v)
                     break
         self.d_gains = torch.tensor(self.d_gains, device= self.model_device, dtype= torch.float32)
+        self.d_gains_np = (
+            self.d_gains.detach().cpu().numpy().astype(np.float64)
+        )
 
         self.default_dof_pos = torch.zeros(self.NUM_DOF, device= self.model_device, dtype= torch.float32)
         self.dof_pos_ = torch.empty(1, self.NUM_DOF, device= self.model_device, dtype= torch.float32)
@@ -298,6 +311,9 @@ class UnitreeRos2Real(Node):
             name = self.dof_names[i]
             default_joint_angle = self.cfg["init_state"]["default_joint_angles"][name]
             self.default_dof_pos[i] = default_joint_angle
+        self.default_dof_pos_np = (
+            self.default_dof_pos.detach().cpu().numpy().astype(np.float64)
+        )
 
         # actions
         self.num_actions = self.NUM_ACTIONS
@@ -462,6 +478,97 @@ class UnitreeRos2Real(Node):
             now - self.latest_remote_time,
         )
 
+    def set_policy_depth_reset(self, callback):
+        """Register the visual GRU reset hook after models are constructed."""
+        if not callable(callback):
+            raise TypeError("policy depth reset hook must be callable")
+        self.policy_depth_reset = callback
+
+    def _reset_policy_prime_memory(self, now):
+        if self.policy_depth_reset is None:
+            raise RealControlError("policy depth reset hook is not registered")
+        self.actions = torch.zeros(
+            self.NUM_ACTIONS,
+            device=self.model_device,
+            dtype=torch.float32,
+        )
+        reset_policy_context(
+            self.actions,
+            self.proprio_history_buf,
+            self.episode_length_buf,
+            self.policy_depth_reset,
+        )
+        self.policy_prime_gate = PolicyPrimeGate(now)
+        self.policy_prime_cycle = 0
+
+    def begin_policy_prime(self, now=None):
+        """Hold stand while rebuilding current proprioception and visual state."""
+        timestamp = time.monotonic() if now is None else float(now)
+        self.policy_transition.reset()
+        self._reset_policy_prime_memory(timestamp)
+        self.real_control_phase = "policy_prime"
+        self.get_logger().warning(
+            "Stand ramp complete; rebuilding policy context for at least 0.5 "
+            "seconds before Y is accepted."
+        )
+
+    def restart_policy_prime(self, now, reason):
+        """Discard partial prime state after any stale input sample."""
+        had_samples = (
+            self.policy_prime_gate is not None
+            and self.policy_prime_gate.has_samples
+        )
+        if had_samples or self.policy_prime_gate is None:
+            self._reset_policy_prime_memory(float(now))
+        else:
+            self.policy_prime_gate.restart(float(now))
+            self.policy_prime_cycle = 0
+        if had_samples:
+            self.get_logger().warning(f"Policy prime restarted: {reason}")
+
+    def validate_policy_prime_now(self, now):
+        if (
+            self.latest_low_state_time is None
+            or self.latest_remote_time is None
+            or self.latest_depth_time is None
+        ):
+            raise RealControlError(
+                "LowState, remote input, and depth are required for policy prime"
+            )
+        validate_policy_prime_inputs(
+            now - self.latest_low_state_time,
+            now - self.latest_remote_time,
+            now - self.latest_depth_time,
+        )
+
+    def record_policy_prime_sample(self, now, *, depth=False):
+        if self.policy_prime_gate is None:
+            raise RealControlError("policy prime gate is not initialized")
+        self.policy_prime_gate.record_proprio()
+        if depth:
+            self.policy_prime_gate.record_depth()
+        if self.policy_prime_gate.ready(now):
+            self.real_control_phase = "stand_hold"
+            self.get_logger().warning(
+                "Policy prime complete; holding the default pose. Press Y "
+                "once to enter policy control."
+            )
+            return True
+        return False
+
+    def prepare_dryrun_takeover(self):
+        """Start the real takeover trajectory on the isolated dry-run topic."""
+        if not self.dryrun or self.real_control_phase != "dryrun":
+            raise RealControlError("dry-run takeover is unavailable")
+        position, _ = self._current_joint_state()
+        self.startup_ramp_start_q = position.copy()
+        self.startup_ramp_start_time = time.monotonic()
+        self.last_command_target_q = position.copy()
+        self.real_control_phase = "startup_ramp"
+        self.get_logger().warning(
+            "Dry-run takeover started on the isolated LowCmd topic."
+        )
+
     def _wait_for_l1_takeover_hold(self):
         self.get_logger().warning(
             "Release L1, then hold it continuously for one second to authorize "
@@ -497,35 +604,8 @@ class UnitreeRos2Real(Node):
                 return
         raise RealControlError("ROS shutdown before takeover authorization")
 
-    def _wait_for_external_lowcmd_clear(self):
-        gate = PublisherClearGate(time.monotonic())
-        while rclpy.ok():
-            publishers = self.get_publishers_info_by_topic(
-                REAL_LOW_COMMAND_TOPIC
-            )
-            try:
-                publishers_clear = gate.observe(
-                    len(publishers),
-                    time.monotonic(),
-                )
-            except RealControlError as error:
-                details = "; ".join(
-                    describe_publisher_endpoint(endpoint)
-                    for endpoint in publishers
-                )
-                if details:
-                    raise RealControlError(
-                        f"{error}; remaining publishers: {details}"
-                    ) from error
-                raise
-            if publishers_clear:
-                validate_low_command_boundary(True, len(publishers))
-                return
-            rclpy.spin_once(self, timeout_sec=0.05)
-        raise RealControlError("ROS shutdown while waiting for /lowcmd ownership")
-
     def prepare_real_takeover(self):
-        """Release Sport Mode and create /lowcmd only after all gates pass."""
+        """Pre-create /lowcmd, then publish only after Sport Mode is released."""
         if self.dryrun:
             return
         if self.real_control_phase != "sport":
@@ -543,6 +623,19 @@ class UnitreeRos2Real(Node):
         active_mode = str(
             self._call_motion_switcher(CHECK_MODE_API_ID).get("name", "")
         )
+        self._validate_takeover_now(time.monotonic())
+        handoff_position, _ = self._current_joint_state()
+        self.low_cmd_pub = self.create_publisher(
+            LowCmd,
+            REAL_LOW_COMMAND_TOPIC,
+            1,
+        )
+        self.low_cmd_buffer = LowCmd()
+        self.get_logger().warning(
+            "Created /lowcmd publisher before Sport Mode release; real "
+            "publishing remains blocked until CheckMode confirms no active mode."
+        )
+
         release_cycles = 0
         while release_mode_required(active_mode):
             if release_cycles >= RPC_MAX_ATTEMPTS:
@@ -561,33 +654,24 @@ class UnitreeRos2Real(Node):
         else:
             self.get_logger().warning("Sport Mode release verified.")
 
-        self._wait_for_external_lowcmd_clear()
-        self.low_cmd_pub = self.create_publisher(
-            LowCmd,
-            REAL_LOW_COMMAND_TOPIC,
-            1,
-        )
-        self.low_cmd_buffer = LowCmd()
-        position, _ = self._current_joint_state()
-        self.startup_ramp_start_q = position.copy()
+        self.startup_ramp_start_q = handoff_position.copy()
         self.startup_ramp_start_time = time.monotonic()
-        self.last_command_target_q = position.copy()
+        self.last_command_target_q = handoff_position.copy()
+        self.real_lowcmd_authorized = True
         self.real_control_phase = "startup_ramp"
         self._publish_legs_cmd(
-            torch.as_tensor(position, device=self.model_device),
+            torch.as_tensor(handoff_position, device=self.model_device),
             stand=True,
         )
         self.get_logger().warning(
-            "This process exclusively owns /lowcmd. Starting the 3-second "
-            "measured-pose ramp."
+            "CheckMode is empty; published the latched-pose hold immediately "
+            "and started the 3-second measured-pose ramp."
         )
 
     def begin_policy_transition(self):
-        if self.dryrun:
-            return True
         if self.real_control_phase != "stand_hold":
             self.get_logger().warning(
-                "Policy request ignored until the startup stand ramp completes."
+                "Policy request ignored until policy context priming completes."
             )
             return False
         start = self.last_command_target_q
@@ -598,8 +682,6 @@ class UnitreeRos2Real(Node):
         return True
 
     def begin_stand_recovery(self):
-        if self.dryrun:
-            return
         start = self.last_command_target_q
         if start is None:
             start, _ = self._current_joint_state()
@@ -847,13 +929,10 @@ class UnitreeRos2Real(Node):
                         last_actions, 
                         contact], dim=-1)
 
-        self.proprio_history_buf = torch.where(
-            (self.episode_length_buf <= 1)[:, None, None], 
-            torch.stack([proprio] * self.n_hist_len, dim=1),
-            torch.cat([
-                self.proprio_history_buf[:, 1:],
-                proprio.unsqueeze(1)
-            ], dim=1)
+        self.proprio_history_buf = update_proprio_history(
+            self.proprio_history_buf,
+            proprio,
+            self.episode_length_buf,
         )
         end_time = time.monotonic()
 
@@ -878,44 +957,100 @@ class UnitreeRos2Real(Node):
         Thus, the actions has the batch dimension, whose size is 1.
         """
         if isinstance(actions, list):
-            actions = torch.tensor(actions, device=self.model_device).unsqueeze(0)
-        
-        self.actions = actions
+            actions = torch.tensor(
+                actions,
+                device=self.model_device,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+        if self.real_control_phase != "policy":
+            raise RealControlError(
+                "policy output is blocked outside the policy phase"
+            )
 
-        hard_clip = self.cfg["normalization"]["clip_actions"]/self.cfg["control"]["action_scale"]
-        clipped_scaled_action = torch.clip(actions, -hard_clip, hard_clip) * self.cfg["control"]["action_scale"]
-        
-        robot_coordinates_action = clipped_scaled_action + self.default_dof_pos.unsqueeze(0)
-        if not self.dryrun:
-            if self.real_control_phase != "policy":
-                raise RealControlError(
-                    "policy output is blocked outside the policy phase"
-                )
-            guarded = self.policy_transition.apply(
-                robot_coordinates_action[0].detach().cpu().numpy(),
+        raw_action = actions.detach().cpu().numpy().astype(np.float64)
+        if raw_action.shape == (1, self.NUM_ACTIONS):
+            raw_action = raw_action[0]
+        action_scale = float(self.cfg["control"]["action_scale"])
+        clipped_action, requested_target = prepare_policy_action(
+            raw_action,
+            self.default_dof_pos_np,
+            float(self.cfg["normalization"]["clip_actions"]),
+            action_scale,
+        )
+
+        engagement_active = self.policy_transition.active
+        if engagement_active:
+            commanded_target = self.policy_transition.apply(
+                requested_target,
                 time.monotonic(),
             )
-            robot_coordinates_action = torch.as_tensor(
-                guarded,
+            observed_action = executed_target_to_action(
+                commanded_target,
+                self.default_dof_pos_np,
+                action_scale,
+            )
+            self.actions = torch.as_tensor(
+                observed_action,
                 dtype=torch.float32,
                 device=self.model_device,
-            ).unsqueeze(0)
-        self._publish_legs_cmd(robot_coordinates_action[0], stand=False)
+            )
+            if not self.policy_transition.active:
+                self.get_logger().warning(
+                    "Policy engagement complete; clipped policy targets now "
+                    "pass through without engagement limiting."
+                )
+        else:
+            commanded_target = requested_target
+            self.actions = torch.as_tensor(
+                clipped_action,
+                dtype=torch.float32,
+                device=self.model_device,
+            )
+
+        self._publish_legs_cmd(commanded_target, stand=False)
+        return {
+            "phase": self.real_control_phase,
+            "raw_action": raw_action.copy(),
+            "executed_action": executed_target_to_action(
+                commanded_target,
+                self.default_dof_pos_np,
+                action_scale,
+            ),
+            "requested_q": requested_target.copy(),
+            "commanded_q": commanded_target.copy(),
+            "engagement_active": engagement_active,
+        }
 
     def send_stand_action(self, actions):
         """ Send the action to the robot motors, which does the preprocessing
         just like env.step in simulation.
         Thus, the actions has the batch dimension, whose size is 1.
         """
-        actions = torch.tensor(actions, device=self.model_device).unsqueeze(0)
-        self.actions = actions
-
-        self._publish_legs_cmd(actions[0], stand=True)
+        target = np.asarray(actions, dtype=np.float64)
+        self._publish_legs_cmd(target, stand=True)
+        executed_action = executed_target_to_action(
+            target,
+            self.default_dof_pos_np,
+            float(self.cfg["control"]["action_scale"]),
+        )
+        return {
+            "phase": self.real_control_phase,
+            "raw_action": np.zeros(self.NUM_ACTIONS, dtype=np.float64),
+            "executed_action": executed_action,
+            "requested_q": target.copy(),
+            "commanded_q": target.copy(),
+            "engagement_active": False,
+        }
 
     def get_stand_action(self):
-        if not self.dryrun:
+        if self.real_control_phase in (
+            "startup_ramp",
+            "stand_recovery",
+            "policy_prime",
+            "stand_hold",
+        ):
             now = time.monotonic()
-            target = self.default_dof_pos.detach().cpu().numpy().astype(np.float64)
+            target = self.default_dof_pos_np
             if self.real_control_phase == "startup_ramp":
                 if (
                     self.startup_ramp_start_time is None
@@ -930,11 +1065,7 @@ class UnitreeRos2Real(Node):
                     STARTUP_RAMP_S,
                 )
                 if elapsed >= STARTUP_RAMP_S:
-                    self.real_control_phase = "stand_hold"
-                    self.get_logger().warning(
-                        "Startup ramp complete; holding the policy default pose. "
-                        "Press Y once to enter policy control."
-                    )
+                    self.begin_policy_prime(now)
                 return result.tolist()
             if self.real_control_phase == "stand_recovery":
                 if (
@@ -950,13 +1081,12 @@ class UnitreeRos2Real(Node):
                     1.0,
                 )
                 if elapsed >= 1.0:
-                    self.real_control_phase = "stand_hold"
                     self.stand_recovery_start_time = None
                     self.stand_recovery_start_q = None
-                    self.get_logger().warning(
-                        "Policy exited; holding the policy default pose."
-                    )
+                    self.begin_policy_prime(now)
                 return result.tolist()
+            if self.real_control_phase == "policy_prime":
+                return target.tolist()
             if self.real_control_phase == "stand_hold":
                 return target.tolist()
             raise RealControlError(
@@ -999,7 +1129,16 @@ class UnitreeRos2Real(Node):
         """
         if self.low_cmd_pub is None or self.low_cmd_buffer is None:
             raise RealControlError("/lowcmd publisher is not initialized")
-        target = robot_coordinates_action.detach().cpu().numpy()
+        if not self.dryrun:
+            validate_real_low_command_publish(
+                real_output_enabled=True,
+                takeover_authorized=self.real_lowcmd_authorized,
+            )
+        if isinstance(robot_coordinates_action, torch.Tensor):
+            target = robot_coordinates_action.detach().cpu().numpy()
+        else:
+            target = np.asarray(robot_coordinates_action)
+        target = target.astype(np.float64, copy=False)
         if target.shape != (12,) or not np.isfinite(target).all():
             raise RealControlError("joint command must contain 12 finite values")
 
@@ -1008,11 +1147,15 @@ class UnitreeRos2Real(Node):
             real_idx = self.dof_map[sim_idx]
             if not self.dryrun:
                 self.low_cmd_buffer.motor_cmd[real_idx].mode = self.turn_on_motor_mode[sim_idx]
-            self.low_cmd_buffer.motor_cmd[real_idx].q = robot_coordinates_action[sim_idx].item() * self.dof_signs[sim_idx]
+            self.low_cmd_buffer.motor_cmd[real_idx].q = float(target[sim_idx]) * self.dof_signs[sim_idx]
             self.low_cmd_buffer.motor_cmd[real_idx].dq = 0.
             self.low_cmd_buffer.motor_cmd[real_idx].tau = 0.
-            self.low_cmd_buffer.motor_cmd[real_idx].kp = self.p_gains[sim_idx].item()
-            self.low_cmd_buffer.motor_cmd[real_idx].kd = self.d_gains[sim_idx].item()
+            self.low_cmd_buffer.motor_cmd[real_idx].kp = float(
+                self.p_gains_np[sim_idx]
+            )
+            self.low_cmd_buffer.motor_cmd[real_idx].kd = float(
+                self.d_gains_np[sim_idx]
+            )
         
         self.low_cmd_buffer.crc = get_crc(self.low_cmd_buffer)
         self.low_cmd_pub.publish(self.low_cmd_buffer)
@@ -1022,6 +1165,11 @@ class UnitreeRos2Real(Node):
         """ Turn off the motors """
         if self.low_cmd_pub is None or self.low_cmd_buffer is None:
             return
+        if not self.dryrun:
+            validate_real_low_command_publish(
+                real_output_enabled=True,
+                takeover_authorized=self.real_lowcmd_authorized,
+            )
         for sim_idx in range(self.NUM_DOF):
             real_idx = self.dof_map[sim_idx]
             self.low_cmd_buffer.motor_cmd[real_idx].mode = 0x00
@@ -1035,7 +1183,11 @@ class UnitreeRos2Real(Node):
 
     def shutdown_outputs(self):
         """Publish a short all-motors-off tail before destroying a real node."""
-        if self.dryrun or self.low_cmd_pub is None:
+        if (
+            self.dryrun
+            or self.low_cmd_pub is None
+            or not self.real_lowcmd_authorized
+        ):
             return
         for _ in range(10):
             self._turn_off_motors()

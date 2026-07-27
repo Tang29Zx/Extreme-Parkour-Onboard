@@ -58,20 +58,25 @@ python3 run_extreme_parkour.py --logdir traced --mode parkour --nodryrun
 ```
 
 真实模式只能在承重支架上首次验收。启动时节点先加载并warm-up模型，
-此时不创建`/lowcmd` publisher。按日志提示先释放L1，再连续按住L1
-1秒；节点会确认Sport Mode释放且外部`/lowcmd` publisher连续0.5秒
-为零，然后才创建自己的publisher。
+此时不发布`/lowcmd`。按日志提示先释放L1，再连续按住L1 1秒；节点会在
+ReleaseMode前预创建自己的publisher并锁存实测关节角，但保持真实发布禁用。
+CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命令，不等待
+原生publisher endpoint从DDS图中消失。
 
 `traced/`中的`model_38300`策略包使用训练顺序`FL/FR/RL/RR`；节点在LowState/LowCmd
 边界与Unitree的`FR/FL/RR/RL`顺序互换，并同步重排脚端力。更换其他权重时
 必须重新确认其训练关节顺序，不能仅凭对称站姿判断兼容。
 
-- 接管后先等待3秒站姿渐变完成，看到`Startup ramp complete`。
-- 短按并释放 **Y** 进入策略；首次策略目标在1秒内渐变接入。
+- 接管后先等待3秒站姿渐变，再等待0.5秒本体历史和视觉GRU预热；看到
+  `Policy prime complete`后才可按Y。
+- 短按并释放 **Y** 进入策略；前1秒以五次曲线接入且每周期最多变化0.05 rad，
+  与策略目标追平后恢复上游目标直通。
 - 短按 **L2** 退出策略并用1秒回到站姿；不会在`/lowcmd` publisher
   存在时自动恢复Sport Mode。
 - **R2** 是低层接管后的电机关闭急停，机器狗会失去支撑力。
 - `Ctrl+C`退出时也会发送10帧motor-off命令，因此只能在支架承重时停止。
+- `--flight-log-dir`可指定飞行记录目录，默认`~/extreme-flight-logs`；L2、R2、
+  异常或退出时会保存最近5秒数据并在日志中打印文件路径。
 
 ## Notes and Tips
 
@@ -94,7 +99,8 @@ python3 run_extreme_parkour.py --logdir traced --mode walk
 
 不加`--nodryrun`时，节点只向随机的`/lowcmd_dryrun_<id>`话题发布测试
 消息，不创建Sport Mode API发布端；遥控器按键只切换节点内部状态，
-不会调用机器狗的Sport Mode或真实`/lowcmd`。
+不会调用机器狗的Sport Mode或真实`/lowcmd`。短按L1后，dry-run会执行与
+真机相同的3秒站姿、0.5秒policy prime和Y接入保护，便于先验收状态机。
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
 
 ## Performance 

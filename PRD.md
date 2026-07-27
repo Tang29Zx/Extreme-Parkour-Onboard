@@ -44,10 +44,55 @@
 - 模型warm-up必须发生在Sport Mode释放前。
 - 真实接管要求L1先释放、再连续按住1秒，并要求LowState和遥控器新鲜。
 - CheckMode为空时不重复ReleaseMode；ReleaseMode后必须再次CheckMode确认为空。
-- 真实`/lowcmd` publisher只能在外部发布端连续0.5秒为零后创建；15秒未清空则中止。
-- 接管后先用3秒五次平滑从实测关节位姿过渡到策略默认站姿。
-- Y只在站姿完成后生效；策略目标用1秒接入渐变，每20 ms最多变化0.05 rad。
-- dry-run行为和上游策略数学保持不变。
+- L1确认后、ReleaseMode前预创建真实`/lowcmd` publisher和消息缓冲，但在
+  CheckMode确认为空前，任何真实LowCmd发布（包括退出时motor-off）都必须被拒绝。
+- ReleaseMode前锁存新鲜且近似静止的实测关节角；CheckMode确认为空后立即用该
+  位姿发送第一帧保持命令，不等待原生publisher endpoint从DDS图中消失。
+- 接管后以锁存位姿为起点，用3秒五次平滑过渡到策略默认站姿。
+- 启动站姿和每次L2恢复完成后，必须保持默认站姿至少0.5秒，重建至少10帧
+  本体历史和5帧视觉GRU状态；LowState、遥控器或深度超过0.25秒时重新开始预热。
+- Y只在预热完成后生效。进入策略的前1秒使用五次渐变，每周期目标变化不超过
+  0.05 rad；与请求目标追平后取消保护，稳态策略保持上游目标直通。
+- 接入保护期间，策略观测中的上一动作必须反映实际下发目标，而不是未执行的原始动作。
+- dry-run使用相同的站姿预热和Y接入状态机，但继续隔离真实LowCmd与Sport API。
+- 控制周期不逐帧打印tensor；最近5秒控制和视觉状态保存在内存，L2、R2、异常或
+  Ctrl+C时写入NPZ飞行记录。
+
+风险与约束：MotionSwitcher的CheckMode空状态是低层控制权释放的授权事实；DDS
+endpoint的销毁时间不再作为授权条件。首次真机验收仍必须使用承重支架。若ReleaseMode
+或其后的CheckMode失败，节点不得发布任何真实LowCmd。
+
+回滚方式：恢复“释放后等待外部publisher清空再创建自身publisher”的顺序；该顺序
+会重新引入无低层保持命令的空窗，回滚版本不得用于无支撑真机接管。
+
+Y接入保护的回滚边界：可以移除0.5秒状态预热、1秒渐变和0.05 rad限速以恢复上游
+直通，但已观测到第一帧约0.453 rad不对称目标跳变并导致支架侧翻；回滚版本不得再次
+真机进入policy。
+
+## 策略动作裁剪一致性
+
+策略输出必须先在策略空间按`normalization.clip_actions`裁剪，再乘
+`control.action_scale`转换为关节残差。`model_38300`的目标映射为：
+
+```text
+clipped_action = clamp(raw_action, -clip_actions, clip_actions)
+target_q = default_q - clipped_action * action_scale
+```
+
+验收标准：
+
+- `clip_actions=1.2`、`action_scale=0.25`时，任一关节残差不得超过`0.3 rad`。
+- 稳态策略的`self.actions`和下一帧`last_actions`必须保存裁剪后动作，不能保存
+  原始网络输出。
+- Y接入保护期间，`last_actions`继续由实际下发目标按同一减号映射反算；保护追平后
+  切换为裁剪后策略动作。
+- 飞行记录同时保留原始动作、裁剪后请求目标和保护后的实际动作。
+- 非有限动作、非法裁剪上限或非法缩放系数必须在LowCmd发布前拒绝。
+
+非目标：本次不修改策略模型、动作维度、关节顺序、PD增益、机械限位或接入渐变参数。
+
+回滚方式：恢复旧动作预处理和反算公式。旧实现允许最大`1.2 rad`关节残差并会把
+未裁剪动作写入历史，回滚版本不得用于真机策略接管。
 
 ## model_38300关节映射修复
 

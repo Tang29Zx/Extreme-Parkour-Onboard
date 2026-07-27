@@ -55,17 +55,26 @@
 
 ## 真实接管保护（2026-07-27）
 
-- 真实模式在模型warm-up和L1连续1秒确认前不创建`/lowcmd` publisher。
+- 真实模式在模型warm-up和L1连续1秒确认前不创建`/lowcmd` publisher；L1确认后、
+  ReleaseMode前预创建publisher和消息缓冲，但此时真实发布仍被硬门槛禁止。
 - MotionSwitcher使用CheckMode/ReleaseMode/CheckMode确认链；模式已为空时跳过
   ReleaseMode。
-- 外部`/lowcmd` publisher必须连续0.5秒为零；15秒超时时不创建自己的
-  publisher，日志会列出剩余endpoint。
-- 接管后从实测关节位姿用3秒五次平滑过渡到策略默认姿态。Y只在
-  `stand_hold`后生效，策略目标再用1秒渐变和0.05 rad/周期限速接入。
+- ReleaseMode前锁存新鲜、近似静止的实测关节位姿；最终CheckMode确认为空后
+  立即发布该位姿保持命令。原生publisher endpoint的DDS销毁延迟不再阻塞接管，
+  消除了已观测到的约5.75秒无有效低层保持命令空窗。
+- 接管后从锁存关节位姿用3秒五次平滑过渡到策略默认姿态，再保持0.5秒重建至少
+  10帧本体历史和5帧视觉GRU状态；任一输入超过0.25秒会重新预热。L2恢复后走
+  同一流程。
+- Y后的第一帧严格保持站姿，随后用1秒五次渐变和0.05 rad/周期上限追赶策略目标；
+  追平后取消保护，稳态策略仍保持上游目标直通。保护期间`last_actions`反映实际
+  下发动作，不记录未执行的原始请求。
 - L2只用1秒退回站姿，不在`/lowcmd` publisher存在时恢复Sport Mode；R2和
   进程退出发送10帧motor-off。
-- 9个真实接管纯函数测试通过；尚未在Jetson上运行MotionSwitcher接管链或真实
-  `/lowcmd`。
+- 预创建publisher后，最终CheckMode为空前，普通腿命令和退出motor-off都不得发布。
+- 控制节点不再逐帧打印yaw、动作tensor和分段耗时；最近250个控制周期及50次视觉
+  更新保存在内存，L2恢复完成、R2关电机后、异常或退出时写入时间戳NPZ。
+- 32个测试、Python 3.8语法检查和diff检查通过；新policy prime、Y接入保护、飞行
+  记录和Jetson循环p95尚未在Jetson dry-run或真机验收。
 
 ## 权重来源
 
@@ -93,3 +102,26 @@
 - 当前证据支持后髋高温或RL历史通信丢失与故障灯相关，但Unitree公开消息文档未
   定义`lost`值语义或温度告警阈值，不能仅凭该字段确定最终故障码。冷却、正常
   重启并采集无自定义控制的基线前，禁止再次真机接管。
+- 后续日志确认另一次故障发生在策略启动前：Sport Mode于17:28:46释放，自有
+  `/lowcmd`直到17:28:52才创建，约5.75秒空窗内后腿先塌下；随后从塌下位姿恢复
+  站姿触发红灯。原生Sport Mode正常且该次没有策略动作，根因转向低层接管时序，
+  因此删除“等待原生publisher endpoint消失”门槛，改为预创建但确认释放前禁发。
+- 修复接管空窗后的支架测试中，释放确认到锁存位姿首帧仅约5.6 ms且3秒站姿正常；
+  用户按Y后发生侧翻，但`~/extreme-control-handoff.log`在`Startup ramp complete`
+  后停止，没有记录Y或动作，无法复原该次精确LowCmd。Jetson代码和三个模型资产
+  哈希与本地一致，事后LowState约为roll -2.9°、pitch -0.1°、12电机`lost=0`。
+- 上一次完整策略日志显示同一模型第一帧相对站姿最大目标跳变约0.453 rad，且左右
+  明显不对称；同时warm-up到Y之间的10帧本体历史和视觉GRU状态长期未刷新。因此
+  后续真机前必须先通过状态重建、Y短时接入保护和飞行记录的dry-run验收。
+
+## model_38300动作裁剪契约（2026-07-27）
+
+- 策略原始输出必须先按`normalization.clip_actions=1.2`裁剪，再乘
+  `control.action_scale=0.25`；最大关节残差为`0.3 rad`，不能把裁剪阈值除以
+  `action_scale`后放大到`4.8`。
+- 该模型的关节目标映射固定为
+  `target_q = default_q - clipped_action * action_scale`；保护后目标反算动作使用
+  `(default_q - commanded_q) / action_scale`。
+- 稳态`self.actions`和观测中的`last_actions`保存裁剪后动作；Y接入保护期间保存
+  实际下发目标反算出的动作，原始网络输出只用于飞行记录。
+- 本地34项测试通过，Python 3.8语法与diff检查通过；未在Jetson dry-run或真机验证。

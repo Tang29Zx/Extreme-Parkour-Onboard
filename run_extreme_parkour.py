@@ -1,5 +1,5 @@
 import rclpy
-from unitree_ros2_real import UnitreeRos2Real, get_euler_xyz
+from unitree_ros2_real import UnitreeRos2Real
 
 import os
 import os.path as osp
@@ -10,20 +10,22 @@ import numpy as np
 import torch
 from torch import nn
 
+from flight_recorder import FlightRecorder
+from joint_mapping import FOOT_REAL_TO_SIM
+from real_control_safety import RealControlError
 from rsl_rl.modules import RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
 
 from sport_api_constants import *
 
 class Go2Node(UnitreeRos2Real):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, flight_log_dir, **kwargs):
         super().__init__(*args, robot_class_name= "Go2", **kwargs)
         self.global_counter = 0
         self.visual_update_interval = 5
+        self.flight_recorder = FlightRecorder(flight_log_dir)
+        self.flight_record_error_reported = False
+        self.pending_flight_reason = None
 
-        self.actions_sim = torch.from_numpy(np.load('Action_sim_335-11_flat.npy')).to(self.model_device)
-
-        self.sim_ite = 3
- 
         self.use_stand_policy = False
         self.use_parkour_policy = False
         self.use_sport_mode = True
@@ -41,6 +43,7 @@ class Go2Node(UnitreeRos2Real):
 
             depth_image = self._get_depth_image()
             self.depth_latent_yaw = self.depth_encode(depth_image, proprio)
+            self._record_visual_sample(depth_image, self.depth_latent_yaw)
 
             get_obs_time = time.monotonic()
 
@@ -63,10 +66,102 @@ class Go2Node(UnitreeRos2Real):
                 "total time: {:.5f}".format(publish_time - start_time)
             )
 
-    def register_models(self, turn_obs, depth_encode, policy):
+    def register_models(
+        self,
+        turn_obs,
+        depth_encode,
+        policy,
+        reset_depth_hidden,
+    ):
         self.turn_obs = turn_obs
         self.depth_encode = depth_encode
         self.policy = policy
+        self.set_policy_depth_reset(reset_depth_hidden)
+
+    def _record_visual_sample(self, depth_image, visual_output):
+        depth = depth_image.detach().cpu().numpy()
+        output = visual_output.detach().cpu().numpy().reshape(-1)
+        self.flight_recorder.record_visual(
+            timestamp=time.monotonic(),
+            depth_stats=(float(depth.min()), float(depth.max()), float(depth.mean())),
+            visual_output=output,
+        )
+
+    def _update_policy_prime(self):
+        now = time.monotonic()
+        try:
+            self.validate_policy_prime_now(now)
+        except RealControlError as error:
+            self.restart_policy_prime(now, str(error))
+            return
+
+        proprio = self.get_proprio()
+        depth_updated = self.policy_prime_cycle % self.visual_update_interval == 0
+        if depth_updated:
+            depth_image = self._get_depth_image()
+            self.depth_latent_yaw = self.depth_encode(depth_image, proprio)
+            self.last_depth_image = depth_image
+            self._record_visual_sample(depth_image, self.depth_latent_yaw)
+        self.policy_prime_cycle += 1
+        self.record_policy_prime_sample(now, depth=depth_updated)
+
+    def _record_control(self, command, loop_started):
+        now = time.monotonic()
+        position = np.asarray(
+            [
+                self.low_state_buffer.motor_state[self.dof_map[index]].q
+                * self.dof_signs[index]
+                for index in range(self.NUM_DOF)
+            ],
+            dtype=np.float64,
+        )
+        velocity = np.asarray(
+            [
+                self.low_state_buffer.motor_state[self.dof_map[index]].dq
+                * self.dof_signs[index]
+                for index in range(self.NUM_DOF)
+            ],
+            dtype=np.float64,
+        )
+        input_ages = (
+            now - self.latest_low_state_time,
+            now - self.latest_remote_time,
+            now - self.latest_depth_time,
+        )
+        foot_force = [
+            self.low_state_buffer.foot_force[index]
+            for index in FOOT_REAL_TO_SIM
+        ]
+        try:
+            self.flight_recorder.record_control(
+                timestamp=now,
+                phase=command["phase"],
+                engagement_active=command["engagement_active"],
+                raw_action=command["raw_action"],
+                executed_action=command["executed_action"],
+                requested_q=command["requested_q"],
+                commanded_q=command["commanded_q"],
+                measured_q=position,
+                measured_dq=velocity,
+                imu_quaternion=self.low_state_buffer.imu_state.quaternion,
+                foot_force=foot_force,
+                input_ages=input_ages,
+                loop_s=now - loop_started,
+            )
+        except (TypeError, ValueError) as error:
+            if not self.flight_record_error_reported:
+                self.get_logger().error(f"Flight recorder rejected a sample: {error}")
+                self.flight_record_error_reported = True
+
+    def flush_flight_record(self, reason):
+        try:
+            path = self.flight_recorder.flush(reason)
+        except (OSError, ValueError) as error:
+            self.get_logger().error(f"Failed to save flight record: {error}")
+            return None
+        if path is not None:
+            self.get_logger().warning(f"Flight record saved: {path}")
+        return path
 
     def start_main_loop_timer(self, duration):
         self.main_loop_timer = self.create_timer(
@@ -90,7 +185,9 @@ class Go2Node(UnitreeRos2Real):
             self.get_logger().error(
                 "R2 emergency stop: publishing the motor-off tail."
             )
+            self.policy_transition.reset()
             self.shutdown_outputs()
+            self.flush_flight_record("r2_emergency_stop")
             self.real_control_phase = "emergency_stop"
             self.use_stand_policy = False
             self.use_parkour_policy = False
@@ -111,15 +208,21 @@ class Go2Node(UnitreeRos2Real):
 
             if l1_pressed and self.dryrun:
                 self.get_logger().info("Exist the sport mode. Switch to stand policy.")
+                self.prepare_dryrun_takeover()
                 self.use_sport_mode = False
-                self._sport_state_change(0)
                 self.use_stand_policy = True
                 self.use_parkour_policy = False
         
-        if self.use_stand_policy:
-            stand_action = self.get_stand_action()
-            self.send_stand_action(stand_action)
-        
+        if l2_pressed and self.real_control_phase == "policy":
+            self.get_logger().warning(
+                "L2 pressed: leaving policy through the one-second stand ramp."
+            )
+            self.pending_flight_reason = "l2_stand_recovery"
+            self.begin_stand_recovery()
+            self.use_stand_policy = True
+            self.use_parkour_policy = False
+            self.use_sport_mode = False
+
         if y_pressed:
             if self.begin_policy_transition():
                 self.get_logger().info("Y pressed, use the parkour policy")
@@ -128,75 +231,42 @@ class Go2Node(UnitreeRos2Real):
                 self.use_sport_mode = False
                 self.global_counter = 0
 
+        if self.use_stand_policy:
+            loop_started = time.monotonic()
+            stand_action = self.get_stand_action()
+            command = self.send_stand_action(stand_action)
+            if self.real_control_phase == "policy_prime":
+                if self.pending_flight_reason is not None:
+                    self.flush_flight_record(self.pending_flight_reason)
+                    self.pending_flight_reason = None
+                self._update_policy_prime()
+            self._record_control(command, loop_started)
+
         if self.use_parkour_policy:
             self.use_stand_policy = False
             self.use_sport_mode = False
             
-            start_time = time.monotonic()
+            loop_started = time.monotonic()
 
             proprio = self.get_proprio()
-            get_pro_time = time.monotonic()
-
             proprio_history = self._get_history_proprio()
-            get_hist_pro_time = time.monotonic()
-
-            # print('proprioception: ', proprio)
-            # print('history proprioception: ', proprio_history)
 
             if self.global_counter % self.visual_update_interval == 0:
                 depth_image = self._get_depth_image()
                 if self.global_counter == 0:
                     self.last_depth_image = depth_image
                 self.depth_latent_yaw = self.depth_encode(self.last_depth_image, proprio)
+                self._record_visual_sample(
+                    self.last_depth_image,
+                    self.depth_latent_yaw,
+                )
                 self.last_depth_image = depth_image
-                # print('depth latent: ', self.depth_latent_yaw)
-            get_obs_time = time.monotonic()
 
             obs = self.turn_obs(proprio, self.depth_latent_yaw, proprio_history, self.n_proprio, self.n_depth_latent, self.n_hist_len)
-            turn_obs_time = time.monotonic()
-
             action = self.policy(obs)
-            policy_time = time.monotonic()
-            # print('action before clip and normalize: ', action)
-
-            # action = self.actions_sim[self.sim_ite, :]
-            self.send_action(action)
-            print('action: ', action)
-            self.sim_ite += 1
-
-            publish_time = time.monotonic()
-            print(
-                "get proprio time: {:.5f}".format(get_pro_time - start_time),
-                "get hist pro time: {:.5f}".format(get_hist_pro_time - get_pro_time),
-                "get_depth time: {:.5f}".format(get_obs_time - get_hist_pro_time),
-                "get obs time: {:.5f}".format(get_obs_time - start_time),
-                "turn_obs_time: {:.5f}".format(turn_obs_time - get_obs_time),
-                "policy_time: {:.5f}".format(policy_time - turn_obs_time),
-                "publish_time: {:.5f}".format(publish_time - policy_time),
-                "total time: {:.5f}".format(publish_time - start_time)
-            )
-
+            command = self.send_action(action)
+            self._record_control(command, loop_started)
             self.global_counter += 1
-
-        if l2_pressed:
-            self.reset_obs()
-            if self.dryrun:
-                self.get_logger().info(
-                    "L2 pressed, stop using parkour policy, switch to sport mode."
-                )
-                self.use_stand_policy = False
-                self.use_parkour_policy = False
-                self.use_sport_mode = True
-                self._sport_state_change(1)
-                self._sport_mode_change(ROBOT_SPORT_API_ID_BALANCESTAND)
-            elif self.real_control_phase == "policy":
-                self.get_logger().warning(
-                    "L2 pressed: leaving policy through the one-second stand ramp."
-                )
-                self.begin_stand_recovery()
-                self.use_stand_policy = True
-                self.use_parkour_policy = False
-                self.use_sport_mode = False
 
 
 @torch.inference_mode()
@@ -219,6 +289,7 @@ def main(args):
         model_device= device,
         dryrun= not args.nodryrun,
         mode = args.mode,
+        flight_log_dir=args.flight_log_dir,
     )
 
     env_node.get_logger().info("Model loaded from: {}".format(osp.join(args.logdir)))
@@ -249,8 +320,6 @@ def main(args):
     def turn_obs(proprio, depth_latent_yaw, proprio_history, n_proprio, n_depth_latent, n_hist_len):
         depth_latent = depth_latent_yaw[:, :-2]
         yaw = depth_latent_yaw[:, -2:] * 1.5
-        print('yaw: ', yaw)
-        
         proprio[:, 6:8] = yaw
 
         lin_vel_latent = estimator(proprio)
@@ -265,17 +334,26 @@ def main(args):
 
     def encode_depth(depth_image, proprio):
         depth_latent_yaw = depth_encoder(depth_image, proprio)
-        if torch.isnan(depth_latent_yaw).any():
-            print('depth_latent_yaw contains nan and the depth image is: ', depth_image)
+        if not torch.isfinite(depth_latent_yaw).all():
+            raise RuntimeError("depth encoder output contains NaN or Inf")
         return depth_latent_yaw
+
+    def reset_depth_hidden():
+        depth_encoder.hidden_states = None
     
     def actor_model(obs):
         action = actor(obs)
         return action
 
-    env_node.register_models(turn_obs=turn_obs, depth_encode=encode_depth, policy=actor_model)
+    env_node.register_models(
+        turn_obs=turn_obs,
+        depth_encode=encode_depth,
+        policy=actor_model,
+        reset_depth_hidden=reset_depth_hidden,
+    )
 
 
+    exit_reason = "shutdown"
     try:
         env_node.start_ros_handlers()
         env_node.warm_up()
@@ -300,9 +378,13 @@ def main(args):
             env_node.start_main_loop_timer(duration)
             rclpy.spin(env_node)
     except KeyboardInterrupt:
-        pass
+        exit_reason = "keyboard_interrupt"
+    except Exception:
+        exit_reason = "exception"
+        raise
     finally:
         env_node.shutdown_outputs()
+        env_node.flush_flight_record(exit_reason)
         env_node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
@@ -319,6 +401,12 @@ if __name__ == "__main__":
         help= "Select which mode to run the main policy control iteration",
     )
     parser.add_argument("--mode", type= str, default= "parkour", choices=["parkour", "walk"])
+    parser.add_argument(
+        "--flight-log-dir",
+        type=str,
+        default=osp.expanduser("~/extreme-flight-logs"),
+        help="Directory for timestamped policy flight-record NPZ files.",
+    )
     args = parser.parse_args()
     
     main(args)

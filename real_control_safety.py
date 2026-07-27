@@ -2,7 +2,7 @@
 
 import json
 import math
-from typing import Optional, Sequence
+from typing import Sequence, Tuple
 
 import numpy as np
 
@@ -14,12 +14,13 @@ CHECK_MODE_API_ID = 1001
 RELEASE_MODE_API_ID = 1003
 RPC_TIMEOUT_S = 2.0
 RPC_MAX_ATTEMPTS = 3
-PUBLISHER_CLEAR_TIMEOUT_S = 15.0
-PUBLISHER_CLEAR_STABLE_S = 0.5
 TAKEOVER_HOLD_S = 1.0
 INPUT_TIMEOUT_S = 0.25
 TAKEOVER_MAX_JOINT_VELOCITY = 0.5
 STARTUP_RAMP_S = 3.0
+POLICY_PRIME_S = 0.5
+POLICY_PRIME_PROPRIO_SAMPLES = 10
+POLICY_PRIME_DEPTH_SAMPLES = 5
 POLICY_ENGAGEMENT_RAMP_S = 1.0
 POLICY_TARGET_MAX_STEP_RAD = 0.05
 
@@ -28,65 +29,9 @@ class RealControlError(RuntimeError):
     """Raised when a real-output boundary cannot be proven safe."""
 
 
-class PublisherClearGate:
-    """Require zero external publishers for one continuous time window."""
-
-    def __init__(
-        self,
-        start_time: float,
-        timeout_s: float = PUBLISHER_CLEAR_TIMEOUT_S,
-        stable_s: float = PUBLISHER_CLEAR_STABLE_S,
-    ) -> None:
-        start = float(start_time)
-        self.timeout_s = float(timeout_s)
-        self.stable_s = float(stable_s)
-        if not all(
-            math.isfinite(value)
-            for value in (start, self.timeout_s, self.stable_s)
-        ):
-            raise ValueError("publisher clear timing must be finite.")
-        if self.timeout_s <= 0.0 or self.stable_s <= 0.0:
-            raise ValueError("publisher clear timing must be positive.")
-        self.deadline = start + self.timeout_s
-        self.clear_since = None
-
-    def observe(self, external_publisher_count: int, now: float) -> bool:
-        count = int(external_publisher_count)
-        timestamp = float(now)
-        if count < 0:
-            raise ValueError("external publisher count cannot be negative.")
-        if not math.isfinite(timestamp):
-            raise ValueError("publisher observation time must be finite.")
-        if timestamp > self.deadline:
-            raise RealControlError(
-                "external /lowcmd publisher did not clear within "
-                f"{self.timeout_s:.1f} seconds"
-            )
-        if count == 0:
-            if self.clear_since is None:
-                self.clear_since = timestamp
-            if timestamp - self.clear_since >= self.stable_s:
-                return True
-        else:
-            self.clear_since = None
-        return False
-
-
 def release_mode_required(active_mode: str) -> bool:
     """Return whether MotionSwitcher still has an active mode to release."""
     return bool(str(active_mode).strip())
-
-
-def describe_publisher_endpoint(endpoint) -> str:
-    """Return stable publisher identity fields for takeover diagnostics."""
-    node_name = str(getattr(endpoint, "node_name", "unknown"))
-    node_namespace = str(getattr(endpoint, "node_namespace", "unknown"))
-    endpoint_gid = getattr(endpoint, "endpoint_gid", ())
-    try:
-        gid = bytes(endpoint_gid).hex()
-    except (TypeError, ValueError):
-        gid = str(endpoint_gid)
-    return f"node={node_namespace}/{node_name}, gid={gid or 'unknown'}"
 
 
 def build_motion_request(request, api_id: int, request_id: int):
@@ -126,17 +71,16 @@ def parse_motion_response(response, request_id: int, api_id: int) -> dict:
     return decoded
 
 
-def validate_low_command_boundary(
+def validate_real_low_command_publish(
     real_output_enabled: bool,
-    external_publisher_count: int,
+    takeover_authorized: bool,
 ) -> None:
-    """Reject creation of the real publisher without exclusive ownership."""
+    """Reject real LowCmd publication until MotionSwitcher released control."""
     if not real_output_enabled:
         raise RealControlError("real /lowcmd output is not enabled")
-    count = int(external_publisher_count)
-    if count != 0:
+    if not takeover_authorized:
         raise RealControlError(
-            f"refusing /lowcmd while {count} external publisher(s) remain"
+            "real /lowcmd publishing is blocked until CheckMode confirms release"
         )
 
 
@@ -162,6 +106,26 @@ def validate_takeover_inputs(
     if float(np.max(np.abs(velocity))) > TAKEOVER_MAX_JOINT_VELOCITY:
         raise RealControlError(
             "joint velocity is too high for low-level takeover"
+        )
+
+
+def validate_policy_prime_inputs(
+    low_state_age_s: float,
+    remote_age_s: float,
+    depth_age_s: float,
+) -> None:
+    """Require fresh state, remote, and depth while priming policy memory."""
+    ages = (
+        float(low_state_age_s),
+        float(remote_age_s),
+        float(depth_age_s),
+    )
+    if not all(
+        math.isfinite(age) and 0.0 <= age <= INPUT_TIMEOUT_S
+        for age in ages
+    ):
+        raise RealControlError(
+            "LowState, remote input, and depth must be fresh for policy prime"
         )
 
 
@@ -193,8 +157,56 @@ def interpolate_pose(
     return start + (end - start) * blend
 
 
+class PolicyPrimeGate:
+    """Count fresh policy context samples over a minimum hold duration."""
+
+    def __init__(
+        self,
+        start_time: float,
+        duration_s: float = POLICY_PRIME_S,
+        proprio_samples: int = POLICY_PRIME_PROPRIO_SAMPLES,
+        depth_samples: int = POLICY_PRIME_DEPTH_SAMPLES,
+    ) -> None:
+        self.duration_s = float(duration_s)
+        self.required_proprio_samples = int(proprio_samples)
+        self.required_depth_samples = int(depth_samples)
+        if not math.isfinite(self.duration_s) or self.duration_s <= 0.0:
+            raise ValueError("policy prime duration must be positive")
+        if self.required_proprio_samples <= 0 or self.required_depth_samples <= 0:
+            raise ValueError("policy prime sample counts must be positive")
+        self.restart(start_time)
+
+    def restart(self, start_time: float) -> None:
+        timestamp = float(start_time)
+        if not math.isfinite(timestamp):
+            raise ValueError("policy prime start time must be finite")
+        self.start_time = timestamp
+        self.proprio_samples = 0
+        self.depth_samples = 0
+
+    @property
+    def has_samples(self) -> bool:
+        return self.proprio_samples > 0 or self.depth_samples > 0
+
+    def record_proprio(self) -> None:
+        self.proprio_samples += 1
+
+    def record_depth(self) -> None:
+        self.depth_samples += 1
+
+    def ready(self, now: float) -> bool:
+        timestamp = float(now)
+        if not math.isfinite(timestamp):
+            raise ValueError("policy prime observation time must be finite")
+        return (
+            timestamp - self.start_time >= self.duration_s
+            and self.proprio_samples >= self.required_proprio_samples
+            and self.depth_samples >= self.required_depth_samples
+        )
+
+
 class PolicyTransitionGuard:
-    """Blend policy entry and bound every commanded target step."""
+    """Smooth only the handoff from stand hold to policy targets."""
 
     def __init__(
         self,
@@ -210,6 +222,7 @@ class PolicyTransitionGuard:
         self.start_time = None
         self.start_q = None
         self.previous_q = None
+        self.first_apply = False
 
     @property
     def active(self) -> bool:
@@ -223,12 +236,19 @@ class PolicyTransitionGuard:
         self.start_time = timestamp
         self.start_q = start.copy()
         self.previous_q = start.copy()
+        self.first_apply = True
 
     def apply(self, requested_q: Sequence[float], now: float) -> np.ndarray:
         if not self.active or self.start_q is None or self.previous_q is None:
             raise RealControlError("policy transition was not initialized")
         requested = _joint_vector(requested_q, "policy target")
-        elapsed = max(0.0, float(now) - float(self.start_time))
+        timestamp = float(now)
+        if not math.isfinite(timestamp):
+            raise RealControlError("policy transition time must be finite")
+        if self.first_apply:
+            self.first_apply = False
+            return self.start_q.copy()
+        elapsed = max(0.0, timestamp - float(self.start_time))
         blend = quintic_smoothstep(elapsed / self.ramp_s)
         blended = self.start_q + blend * (requested - self.start_q)
         delta = np.clip(
@@ -238,9 +258,49 @@ class PolicyTransitionGuard:
         )
         target = self.previous_q + delta
         self.previous_q = target.copy()
+        if (
+            elapsed >= self.ramp_s
+            and float(np.max(np.abs(requested - target))) <= 1e-12
+        ):
+            self.reset()
         return target
 
     def reset(self) -> None:
         self.start_time = None
         self.start_q = None
         self.previous_q = None
+        self.first_apply = False
+
+
+def executed_target_to_action(
+    target_q: Sequence[float],
+    default_q: Sequence[float],
+    action_scale: float,
+) -> np.ndarray:
+    """Convert an executed joint target back to policy-space action units."""
+    target = _joint_vector(target_q, "executed target")
+    default = _joint_vector(default_q, "default target")
+    scale = float(action_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise RealControlError("action scale must be positive")
+    return (default - target) / scale
+
+
+def prepare_policy_action(
+    raw_action: Sequence[float],
+    default_q: Sequence[float],
+    clip_actions: float,
+    action_scale: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Clip policy-space actions before converting them to joint targets."""
+    action = _joint_vector(raw_action, "policy action")
+    default = _joint_vector(default_q, "default target")
+    clip_limit = float(clip_actions)
+    scale = float(action_scale)
+    if not math.isfinite(clip_limit) or clip_limit <= 0.0:
+        raise RealControlError("action clip limit must be positive")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise RealControlError("action scale must be positive")
+    clipped_action = np.clip(action, -clip_limit, clip_limit)
+    target_q = default - clipped_action * scale
+    return clipped_action, target_q

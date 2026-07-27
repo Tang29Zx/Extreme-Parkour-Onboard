@@ -19,6 +19,8 @@
 - 聚焦测试：`python -m unittest tests.test_depth_processing -v`
 - 输出路由：`python -m unittest tests.test_output_routing -v`
 - 真实接管纯函数：`python -m unittest tests.test_real_control_safety -v`
+- 策略上下文：`python -m unittest tests.test_policy_context -v`
+- 飞行记录：`python -m unittest tests.test_flight_recorder -v`
 - 关节边界：`python -m unittest tests.test_joint_mapping -v`
 - Jetson环境：`bash scripts/setup_jetson.sh`（仅在Jetson上执行）
 - Diff：`git diff --check`
