@@ -15,6 +15,22 @@ This repository provides an **unofficial implementation** for deploying the proj
 #### Environment Setup
 Make sure the environment is properly set up on your Go2 robot, including rclpy, torch and unitree sdk.
 
+Jetson上首次同步仓库后执行一次：
+
+```bash
+cd ~/Extreme-Parkour-Onboard
+bash scripts/setup_jetson.sh
+```
+
+该脚本不从网络安装Torch或torchvision，只将仓库内置`rsl_rl`挂载到已有
+`~/parkour/parkour_venv`，并一次性检查CUDA、ROS、Unitree消息、RealSense、CRC和
+控制/视觉入口。此后每个新终端先执行：
+
+```bash
+cd ~/Extreme-Parkour-Onboard
+source scripts/jetson_env.sh
+```
+
 #### Hardware Setup
 Install the **Intel RealSense D435i** depth camera on the Go2. Verify that the captured images resemble the simulation (can be checked using `rviz`).
 
@@ -29,18 +45,33 @@ ssh unitree@<go2_ip_address>
 python3 visual_extreme_parkour.py --logdir traced
 ```
 
-This script retrieves depth images from the D435i camera and publish them at 100Hz to the appropriate ROS topic.
+该节点使用已经过真机验收的固定深度路径：D435i以`424×240`、Z16、30 FPS采集，
+使用设备`depth_scale`转成米制深度，将`0`、`65535`和超过2米的值置为2米，
+再执行`4×4`面积降采样、训练裁剪和bicubic缩放，最终向
+`/forward_depth_image`发布展平的`58×87`归一化深度。该路径不旋转、不镜像、
+不翻转，且bicubic之后不额外截断。`/camera/forward_depth`同步发布米制
+`32FC1`网络输入用于检查。
 
 3. In a second terminal, start the controller node:
 ```bash
 python3 run_extreme_parkour.py --logdir traced --mode parkour --nodryrun
 ```
-This script fuses the depth image and proprioception data. Now the robot is in the sport mode:
-- Press **R1** to stand up.
-- Press **R2** to lie down.
-- Press **L1** to disable the builtin sport service and execute the stand policy.
-- After turning off the builtin sport service, press **Y** to start executing the parkour policy.
-- When finished, press **L2** to exit the parkour mode and re-enable native motion control.
+
+真实模式只能在承重支架上首次验收。启动时节点先加载并warm-up模型，
+此时不创建`/lowcmd` publisher。按日志提示先释放L1，再连续按住L1
+1秒；节点会确认Sport Mode释放且外部`/lowcmd` publisher连续0.5秒
+为零，然后才创建自己的publisher。
+
+`traced/`中的`model_38300`策略包使用训练顺序`FL/FR/RL/RR`；节点在LowState/LowCmd
+边界与Unitree的`FR/FL/RR/RL`顺序互换，并同步重排脚端力。更换其他权重时
+必须重新确认其训练关节顺序，不能仅凭对称站姿判断兼容。
+
+- 接管后先等待3秒站姿渐变完成，看到`Startup ramp complete`。
+- 短按并释放 **Y** 进入策略；首次策略目标在1秒内渐变接入。
+- 短按 **L2** 退出策略并用1秒回到站姿；不会在`/lowcmd` publisher
+  存在时自动恢复Sport Mode。
+- **R2** 是低层接管后的电机关闭急停，机器狗会失去支撑力。
+- `Ctrl+C`退出时也会发送10帧motor-off命令，因此只能在支架承重时停止。
 
 ## Notes and Tips
 
@@ -60,6 +91,10 @@ Use ``--mode walk`` or ``--mode parkour`` to switch between **walking** and **pa
 ```bash
 python3 run_extreme_parkour.py --logdir traced --mode walk
 ```
+
+不加`--nodryrun`时，节点只向随机的`/lowcmd_dryrun_<id>`话题发布测试
+消息，不创建Sport Mode API发布端；遥控器按键只切换节点内部状态，
+不会调用机器狗的Sport Mode或真实`/lowcmd`。
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
 
 ## Performance 

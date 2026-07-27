@@ -1,286 +1,263 @@
+"""Publish training-equivalent D435i depth for Extreme Parkour inference."""
+
+from collections import OrderedDict
+import json
+import os.path as osp
+import time
+
+import numpy as np
+import pyrealsense2 as rs
 import rclpy
 from rclpy.node import Node
-
+from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray
-from sensor_msgs.msg import Image, CameraInfo
-from unitree_ros2_real import UnitreeRos2Real
-from rclpy.qos import qos_profile_sensor_data
-
-import os, sys
-import os.path as osp
-import json
-import time
-from collections import OrderedDict
-import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.autograd import Variable
 
-from rsl_rl import modules
-
-import pyrealsense2 as rs
-import cv2
-import ros2_numpy as rnp
-import random
-
-from collections import deque
-
-if os.uname().machine in ["x86_64", "amd64"]:
-    sys.path.append(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "x86",
-    ))
-elif os.uname().machine == "aarch64":
-    sys.path.append(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "aarch64",
-    ))
-from crc_module import get_crc
-
-import array
-
-from rsl_rl.modules import RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
-
-@torch.no_grad()
-def resize2d(img, size):
-    return (F.adaptive_avg_pool2d(Variable(img), size)).data
+from depth_processing import (
+    DEPTH_HEIGHT,
+    DEPTH_WIDTH,
+    REALSENSE_DEPTH_HEIGHT,
+    REALSENSE_DEPTH_WIDTH,
+    DepthProcessingConfig,
+    DepthProcessingError,
+    prepare_realsense_depth,
+    preprocess_depth,
+)
 
 
 class VisualHandlerNode(Node):
-    """ A wapper class for the realsense camera """
-    def __init__(self,
-            cfg: dict,
-            cropping: list = [0, 0, 0, 0], # top, bottom, left, right
-            rs_resolution: tuple = (480, 270), # width, height for the realsense camera)
-            rs_fps: int= 30,
-            depth_input_topic= "/camera/forward_depth",
-            camera_info_topic= "/camera/camera_info",
-            forward_depth_image_topic= "/forward_depth_image",
-        ):
+    """Own the D435i stream and publish normalized 58x87 depth."""
+
+    def __init__(
+        self,
+        cfg: dict,
+        rs_resolution=(REALSENSE_DEPTH_WIDTH, REALSENSE_DEPTH_HEIGHT),
+        rs_fps: int = 30,
+        depth_input_topic="/camera/forward_depth",
+        forward_depth_image_topic="/forward_depth_image",
+    ):
         super().__init__("depth_image")
-        self.cfg = cfg
-        self.cropping = cropping
-        self.rs_resolution = rs_resolution
-        self.rs_fps = rs_fps
+        if tuple(rs_resolution) != (
+            REALSENSE_DEPTH_WIDTH,
+            REALSENSE_DEPTH_HEIGHT,
+        ):
+            raise ValueError("RealSense depth resolution must be 424x240.")
+        if rs_fps <= 0:
+            raise ValueError("RealSense FPS must be positive.")
+
+        self.depth_config = DepthProcessingConfig.from_mapping(cfg)
+        self.rs_resolution = tuple(rs_resolution)
+        self.rs_fps = int(rs_fps)
         self.depth_input_topic = depth_input_topic
-        self.camera_info_topic = camera_info_topic
         self.forward_depth_image_topic = forward_depth_image_topic
+        self.rs_pipeline = None
+        self.depth_scale = None
+        self.last_frame_number = None
+        self.last_camera_timestamp_ms = None
 
-
-        self.parse_args()
         self.start_pipeline()
         self.start_ros_handlers()
 
-        # debug
-        # depth_data_sim = np.load('/home/unitree/Desktop/extreme_parkour_onboard/depth_image_random.npy')
-        # depth_data_sim = np.load('/home/unitree/Desktop/extreme_parkour_onboard/depth_image_sim_336-11_flat.npy')
-        # self.depth_data_sim = torch.from_numpy(depth_data_sim.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-
-    def parse_args(self):
-        # self.output_resolution = self.cfg["depth"]["resized"]
-        self.output_resolution = [58, 87]
-        depth_range = [0.0, 3.0]
-        # depth_range = [0.0, 2.0]
-        # self.depth_range = depth_range
-        self.depth_range = (depth_range[0], depth_range[1] * 1000) # [m] -> [mm]
-
-    def start_pipeline(self):
-        self.rs_pipeline = rs.pipeline()
-        self.rs_config = rs.config()
-        self.rs_config.enable_stream(
+    def start_pipeline(self) -> None:
+        """Open the exact D435i stream used by the accepted deployment path."""
+        pipeline = rs.pipeline()
+        stream_config = rs.config()
+        stream_config.enable_stream(
             rs.stream.depth,
             self.rs_resolution[0],
             self.rs_resolution[1],
             rs.format.z16,
             self.rs_fps,
         )
-        self.rs_profile = self.rs_pipeline.start(self.rs_config)
+        started = False
+        try:
+            profile = pipeline.start(stream_config)
+            started = True
+            depth_scale = float(
+                profile.get_device().first_depth_sensor().get_depth_scale()
+            )
+            if not np.isfinite(depth_scale) or depth_scale <= 0.0:
+                raise RuntimeError("RealSense returned an invalid depth scale.")
+            self.rs_pipeline = pipeline
+            self.depth_scale = depth_scale
+        except Exception:
+            if started:
+                pipeline.stop()
+            raise
 
-        self.rs_align = rs.align(rs.stream.depth)
+    def stop_pipeline(self) -> None:
+        if self.rs_pipeline is not None:
+            self.rs_pipeline.stop()
+        self.rs_pipeline = None
+        self.depth_scale = None
+        self.last_frame_number = None
+        self.last_camera_timestamp_ms = None
 
-        # build rs builtin filters
-        # self.rs_decimation_filter = rs.decimation_filter()
-        # self.rs_decimation_filter.set_option(rs.option.filter_magnitude, 6)
-        self.rs_hole_filling_filter = rs.hole_filling_filter()
-        self.rs_spatial_filter = rs.spatial_filter()
-        self.rs_spatial_filter.set_option(rs.option.filter_magnitude, 5)
-        self.rs_spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
-        self.rs_spatial_filter.set_option(rs.option.filter_smooth_delta, 1)
-        self.rs_spatial_filter.set_option(rs.option.holes_fill, 4)
-        self.rs_temporal_filter = rs.temporal_filter()
-        self.rs_temporal_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
-        self.rs_temporal_filter.set_option(rs.option.filter_smooth_delta, 1)
-        # using a list of filters to define the filtering order
-        self.rs_filters = [
-            # self.rs_decimation_filter,
-            self.rs_hole_filling_filter,
-            self.rs_spatial_filter,
-            self.rs_temporal_filter,
-        ]
-
-    def start_ros_handlers(self):
+    def start_ros_handlers(self) -> None:
         self.depth_input_pub = self.create_publisher(
             Image,
             self.depth_input_topic,
             1,
         )
-
         self.forward_depth_image_pub = self.create_publisher(
             Float32MultiArray,
             self.forward_depth_image_topic,
             1,
         )
-        
-        self.get_logger().info("ros handlers started")
-
-    def publish_camera_info_callback(self):
-        self.camera_info_msg.header.stamp = self.get_clock().now().to_msg()
-        self.get_logger().info("camera info published", once= True)
-        self.camera_info_pub.publish(self.camera_info_msg)
-
-    def get_depth_frame(self):
-        # read from pyrealsense2, preprocess and write the model embedding to the buffer
-        latency_range  = [0.08, 0.142]
-        rs_frame = self.rs_pipeline.wait_for_frames(int( latency_range[1] * 1000 )) # ms
-        
-        depth_frame = rs_frame.get_depth_frame()
-        if not depth_frame:
-            self.get_logger().error("No depth frame", throttle_duration_sec= 1)
-            return
-        
-        for rs_filter in self.rs_filters:
-            depth_frame = rs_filter.process(depth_frame)
-        
-        depth_image_pyt = torch.from_numpy(np.asanyarray(depth_frame.get_data()).astype(np.float32)).unsqueeze(0)
-        # depth_image_np = np.rot90(depth_image_np, k= 2) # k = 2 for rotate 90 degree twice   
-        
-        # apply torch filters
-        depth_image_pyt = depth_image_pyt[:,
-            self.cropping[0]: -self.cropping[1]-1,
-            self.cropping[2]: -self.cropping[3]-1,
-        ]
-
-        depth_image_pyt = torch.clip(depth_image_pyt, self.depth_range[0], self.depth_range[1]) / (self.depth_range[1] - self.depth_range[0])
-        depth_image_pyt = resize2d(depth_image_pyt, self.output_resolution)
-
-        # publish the depth image input to ros topic
-        self.get_logger().info("depth range: {}-{}".format(*self.depth_range), once= True)
-        depth_input_data = (
-            depth_image_pyt.detach().cpu().numpy() * (self.depth_range[1] - self.depth_range[0]) + self.depth_range[0]).astype(np.uint16)[0] # (h, w) unit [mm]
-        # print('depth input data: ', depth_input_data.min(), depth_input_data.max())
-        
-        depth_image_pyt -= 0.5 # [-0.5, 0.5])
-
-        depth_input_msg = rnp.msgify(Image, depth_input_data.astype(np.float32), encoding= "32FC1")
-        depth_input_msg.header.stamp = self.get_clock().now().to_msg()
-        depth_input_msg.header.frame_id = "d435_sim_depth_link"
-        self.depth_input_pub.publish(depth_input_msg)
-        self.get_logger().info("depth input published", once= True)
-
-        return depth_image_pyt
-
-    def publish_depth_data(self, depth_data):
-
-        msg = Float32MultiArray()
-        msg.data = depth_data.flatten().detach().cpu().numpy().tolist()
-
-        self.forward_depth_image_pub.publish(msg)
-        self.get_logger().info("depth data published", once= True)
-
-    def start_main_loop_timer(self, duration):
-        self.create_timer(
-            duration,
-            self.main_loop,
+        self.get_logger().info(
+            "D435i depth publisher started: 424x240 -> 60x106 -> 58x87"
         )
 
-    def main_loop(self):
-        depth_image_pyt = self.get_depth_frame()
-        if depth_image_pyt is not None:
-            # depth_image_pyt = torch.zeros_like(depth_image_pyt) + 0.5
-            # depth_image_pyt = self.depth_data_sim
-            self.publish_depth_data(depth_image_pyt)
+    def _publish_metric_preview(self, normalized_depth: torch.Tensor) -> None:
+        """Publish the exact resized network field in meters for inspection."""
+        metric = (
+            (normalized_depth[0] + 0.5)
+            * (self.depth_config.far_clip - self.depth_config.near_clip)
+            + self.depth_config.near_clip
+        )
+        metric_data = np.ascontiguousarray(metric.cpu().numpy(), dtype=np.float32)
+        message = Image()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = "d435_sim_depth_link"
+        message.height = DEPTH_HEIGHT
+        message.width = DEPTH_WIDTH
+        message.encoding = "32FC1"
+        message.is_bigendian = 0
+        message.step = DEPTH_WIDTH * np.dtype(np.float32).itemsize
+        message.data = metric_data.tobytes()
+        self.depth_input_pub.publish(message)
+
+    @torch.inference_mode()
+    def get_depth_frame(self):
+        """Read one frame and return normalized ``(1, 58, 87)`` depth."""
+        if self.rs_pipeline is None or self.depth_scale is None:
+            raise RuntimeError("RealSense pipeline is not started.")
+        try:
+            frames = self.rs_pipeline.wait_for_frames(1000)
+            depth_frame = frames.get_depth_frame()
+            if not depth_frame:
+                self.get_logger().error("RealSense returned no depth frame.")
+                return None
+            frame_number = int(depth_frame.get_frame_number())
+            camera_timestamp_ms = float(depth_frame.get_timestamp())
+            if not np.isfinite(camera_timestamp_ms):
+                raise RuntimeError("RealSense returned a non-finite timestamp.")
+            if (
+                self.last_frame_number is not None
+                and frame_number <= self.last_frame_number
+            ):
+                raise RuntimeError("RealSense frame number did not advance.")
+            if (
+                self.last_camera_timestamp_ms is not None
+                and camera_timestamp_ms <= self.last_camera_timestamp_ms
+            ):
+                raise RuntimeError("RealSense camera timestamp did not advance.")
+            raw_z16 = np.asanyarray(depth_frame.get_data()).copy()
+            metric_source = prepare_realsense_depth(
+                raw_z16,
+                self.depth_scale,
+                self.depth_config,
+            )
+            normalized = preprocess_depth(
+                metric_source,
+                self.depth_config,
+                device="cpu",
+            )
+            self.last_frame_number = frame_number
+            self.last_camera_timestamp_ms = camera_timestamp_ms
+        except (DepthProcessingError, RuntimeError) as error:
+            self.get_logger().error(f"Rejected D435i depth frame: {error}")
+            return None
+        except Exception as error:
+            self.get_logger().error(f"Failed to acquire D435i depth frame: {error}")
+            return None
+
+        self._publish_metric_preview(normalized)
+        return normalized
+
+    def publish_depth_data(self, depth_data: torch.Tensor) -> None:
+        if tuple(depth_data.shape) != (1, DEPTH_HEIGHT, DEPTH_WIDTH):
+            raise DepthProcessingError(
+                "Published depth must have shape (1, 58, 87), "
+                f"got {tuple(depth_data.shape)}."
+            )
+        message = Float32MultiArray()
+        message.data = depth_data.flatten().cpu().numpy().tolist()
+        self.forward_depth_image_pub.publish(message)
+
+    def start_main_loop_timer(self, duration: float) -> None:
+        self.create_timer(duration, self.main_loop)
+
+    def main_loop(self) -> None:
+        depth_image = self.get_depth_frame()
+        if depth_image is not None:
+            self.publish_depth_data(depth_image)
         else:
-            self.get_logger().warn("One frame of depth latent if not acquired")
+            self.get_logger().warning("One D435i depth frame was not published.")
+
 
 @torch.inference_mode()
 def main(args):
     rclpy.init()
+    visual_node = None
+    try:
+        if args.logdir is None:
+            raise ValueError("Please provide --logdir.")
+        with open(osp.join(args.logdir, "config.json"), "r") as config_file:
+            config = json.load(config_file, object_pairs_hook=OrderedDict)
 
-    assert args.logdir is not None, "Please provide a logdir"
-    with open(osp.join(args.logdir, "config.json"), "r") as f:
-        config_dict = json.load(f, object_pairs_hook= OrderedDict)
-    print(config_dict)
-        
-    device = "cpu"
-    # duration = config_dict["sensor"]["forward_camera"]["refresh_duration"] # in sec
-    duration = 0.01 # duration
+        visual_node = VisualHandlerNode(
+            cfg=config,
+            rs_resolution=(args.width, args.height),
+            rs_fps=args.fps,
+        )
+        duration = 1.0 / args.fps
+        if args.loop_mode == "while":
+            rclpy.spin_once(visual_node, timeout_sec=0.0)
+            while rclpy.ok():
+                started = time.monotonic()
+                visual_node.main_loop()
+                rclpy.spin_once(visual_node, timeout_sec=0.0)
+                time.sleep(max(0.0, duration - (time.monotonic() - started)))
+        else:
+            visual_node.start_main_loop_timer(duration)
+            rclpy.spin(visual_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if visual_node is not None:
+            visual_node.stop_pipeline()
+            visual_node.destroy_node()
+        rclpy.shutdown()
 
-    visual_node = VisualHandlerNode(
-        cfg= json.load(open(osp.join(args.logdir, "config.json"), "r")),
-        cropping= [args.crop_top, args.crop_bottom, args.crop_left, args.crop_right],
-        rs_resolution= (args.width, args.height),
-        rs_fps= args.fps,
-    )
-
-    if args.loop_mode == "while":
-        rclpy.spin_once(visual_node, timeout_sec= 0.)
-        while rclpy.ok():
-            main_loop_time = time.monotonic()
-            visual_node.main_loop()
-            rclpy.spin_once(visual_node, timeout_sec= 0.)
-            time.sleep(max(0, duration - (time.monotonic() - main_loop_time)))
-    elif args.loop_mode == "timer":
-        visual_node.start_main_loop_timer(duration)
-        rclpy.spin(visual_node)
-
-    visual_node.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--logdir", type= str, default= None, help= "The directory which contains the config.json and model_*.pt files")
-    
-    parser.add_argument("--height",
-        type= int,
-        default= 480,
-        help= "The height of the realsense image",
+    parser.add_argument(
+        "--logdir",
+        type=str,
+        required=True,
+        help="Directory containing config.json and exported model files.",
     )
-    parser.add_argument("--width",
-        type= int,
-        default= 640,
-        help= "The width of the realsense image",
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=REALSENSE_DEPTH_HEIGHT,
+        help="D435i depth height; only 240 is supported.",
     )
-    parser.add_argument("--fps",
-        type= int,
-        default= 30,
-        help= "The fps request to the rs pipeline",
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=REALSENSE_DEPTH_WIDTH,
+        help="D435i depth width; only 424 is supported.",
     )
-    parser.add_argument("--crop_left",
-        type= int,
-        default= 80, # 28
-        help= "num of pixel to crop in the original pyrealsense readings."
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--loop_mode",
+        type=str,
+        default="timer",
+        choices=["while", "timer"],
     )
-    parser.add_argument("--crop_right",
-        type= int,
-        default= 36, # 36
-        help= "num of pixel to crop in the original pyrealsense readings."
-    )
-    parser.add_argument("--crop_top",
-        type= int,
-        default= 60, # 48
-        help= "num of pixel to crop in the original pyrealsense readings."
-    )
-    parser.add_argument("--crop_bottom",
-        type= int,
-        default= 100,
-        help= "num of pixel to crop in the original pyrealsense readings."
-    )
-    parser.add_argument("--loop_mode", type= str, default= "timer",
-        choices= ["while", "timer"],
-        help= "Select which mode to run the main policy control iteration",
-    )
-
-    args = parser.parse_args()
-    main(args)
+    main(parser.parse_args())

@@ -8,9 +8,39 @@ from unitree_go.msg import (
     SportModeState,
     LowCmd,
 )
-from unitree_api.msg import Request, RequestHeader
+from unitree_api.msg import Request, Response
 
 from std_msgs.msg import Float32MultiArray
+
+from joint_mapping import (
+    DOF_SIGNS,
+    FOOT_REAL_TO_SIM,
+    NUM_DOF as GO2_NUM_DOF,
+    SIM_DOF_NAMES,
+    SIM_TO_REAL_DOF,
+)
+from output_routing import resolve_output_topics
+from real_control_safety import (
+    CHECK_MODE_API_ID,
+    MOTION_REQUEST_TOPIC,
+    MOTION_RESPONSE_TOPIC,
+    REAL_LOW_COMMAND_TOPIC,
+    RELEASE_MODE_API_ID,
+    RPC_MAX_ATTEMPTS,
+    RPC_TIMEOUT_S,
+    STARTUP_RAMP_S,
+    TAKEOVER_HOLD_S,
+    PolicyTransitionGuard,
+    PublisherClearGate,
+    RealControlError,
+    build_motion_request,
+    describe_publisher_endpoint,
+    interpolate_pose,
+    parse_motion_response,
+    release_mode_required,
+    validate_low_command_boundary,
+    validate_takeover_inputs,
+)
 
 if os.uname().machine in ["x86_64", "amd64"]:
     sys.path.append(os.path.join(
@@ -62,31 +92,11 @@ class RobotCfgs:
         pass
 
     class Go2:
-        NUM_DOF = 12
+        NUM_DOF = GO2_NUM_DOF
         NUM_ACTIONS = 12
-        # The order of joints has been reindexed in simulation.
-        # So we do not need here.
-        dof_map = [
-            0, 1, 2,
-            3, 4, 5,
-            6, 7, 8,
-            9, 10, 11,
-        ]
-        dof_names = [
-            "FR_hip_joint",
-            "FR_thigh_joint",
-            "FR_calf_joint",
-            "FL_hip_joint",
-            "FL_thigh_joint",
-            "FL_calf_joint",
-            "RR_hip_joint",
-            "RR_thigh_joint",
-            "RR_calf_joint",
-            "RL_hip_joint",
-            "RL_thigh_joint",
-            "RL_calf_joint",
-        ]
-        dof_signs = [1.] * 12
+        dof_map = SIM_TO_REAL_DOF
+        dof_names = SIM_DOF_NAMES
+        dof_signs = DOF_SIGNS
         joint_limits_high = torch.tensor([
             1.0472, 3.4907, -0.83776,
             1.0472, 3.4907, -0.83776,
@@ -155,7 +165,30 @@ class UnitreeRos2Real(Node):
         self.NUM_ACTIONS = getattr(RobotCfgs, robot_class_name).NUM_ACTIONS
         self.robot_namespace = robot_namespace
         self.low_state_topic = low_state_topic
-        self.low_cmd_topic = low_cmd_topic if not dryrun else low_cmd_topic + "_dryrun_" + str(np.random.randint(0, 65535))
+        dryrun_suffix = int(np.random.randint(0, 65535)) if dryrun else None
+        (
+            self.low_cmd_topic,
+            self.sport_state_topic,
+            self.sport_mode_topic,
+        ) = resolve_output_topics(low_cmd_topic, dryrun, dryrun_suffix)
+        self.sport_state_pub = None
+        self.sport_mode_pub = None
+        self.low_cmd_pub = None
+        self.low_cmd_buffer = None
+        self.motion_request_pub = None
+        self.motion_responses = []
+        self.latest_low_state_time = None
+        self.latest_remote_time = None
+        self.latest_depth_time = None
+        self.remote_keys = 0
+        self.remote_rising_edges = 0
+        self.real_control_phase = "dryrun" if dryrun else "sport"
+        self.startup_ramp_start_time = None
+        self.startup_ramp_start_q = None
+        self.stand_recovery_start_time = None
+        self.stand_recovery_start_q = None
+        self.last_command_target_q = None
+        self.policy_transition = PolicyTransitionGuard()
         self.joy_stick_topic = joy_stick_topic
         self.depth_data_topic = depth_data_topic
         self.cfg = cfg
@@ -294,13 +327,15 @@ class UnitreeRos2Real(Node):
     def start_ros_handlers(self):
         """ after initializing the env and policy, register ros related callbacks and topics
         """
-        # ROS publishers
-        self.low_cmd_pub = self.create_publisher(
-            LowCmd,
-            self.low_cmd_topic,
-            1
-        )
-        self.low_cmd_buffer = LowCmd()
+        # Dry-run uses an isolated LowCmd-like topic immediately. Real output is
+        # created only after MotionSwitcher and graph-ownership checks pass.
+        if self.dryrun:
+            self.low_cmd_pub = self.create_publisher(
+                LowCmd,
+                self.low_cmd_topic,
+                1,
+            )
+            self.low_cmd_buffer = LowCmd()
 
         # ROS subscribers
         self.low_state_sub = self.create_subscription(
@@ -319,17 +354,28 @@ class UnitreeRos2Real(Node):
         )
         self.get_logger().info("Wireless controller subscriber started, waiting to receive wireless controller messages.")
 
-        self.sport_state_pub = self.create_publisher(
-            Request,
-            '/api/robot_state/request',
-            1,
-        )
-
-        self.sport_mode_pub = self.create_publisher(
-            Request,
-            '/api/sport/request',
-            1,
-        )
+        if not self.dryrun:
+            self.sport_state_pub = self.create_publisher(
+                Request,
+                self.sport_state_topic,
+                1,
+            )
+            self.sport_mode_pub = self.create_publisher(
+                Request,
+                self.sport_mode_topic,
+                1,
+            )
+            self.motion_request_pub = self.create_publisher(
+                Request,
+                MOTION_REQUEST_TOPIC,
+                10,
+            )
+            self.motion_response_sub = self.create_subscription(
+                Response,
+                MOTION_RESPONSE_TOPIC,
+                self._motion_response_callback,
+                10,
+            )
 
         self.depth_input_sub = self.create_subscription(
             Float32MultiArray,
@@ -340,14 +386,227 @@ class UnitreeRos2Real(Node):
 
         self.get_logger().info("ROS handlers started, waiting to recieve critical low state and wireless controller messages.")
         if not self.dryrun:
-            self.get_logger().warn(f"You are running the code in no-dryrun mode and publishing to '{self.low_cmd_topic}', Please keep safe.")
+            self.get_logger().warn(
+                "Real output requested, but /lowcmd does not exist yet. Model "
+                "warm-up and the explicit L1 takeover gate must complete first."
+            )
         else:
-            self.get_logger().warn(f"You are publishing low cmd to '{self.low_cmd_topic}' because of dryrun mode, Please check and be safe.")
+            self.get_logger().warn(
+                f"Dry-run output isolation enabled: LowCmd is published only to "
+                f"'{self.low_cmd_topic}' and Sport Mode API output is disabled."
+            )
         while rclpy.ok():
             rclpy.spin_once(self)
-            if hasattr(self, "low_state_buffer") and hasattr(self, "joy_stick_buffer"):
+            if (
+                hasattr(self, "low_state_buffer")
+                and hasattr(self, "joy_stick_buffer")
+                and hasattr(self, "depth_data")
+            ):
                 break
-        self.get_logger().info("Low state and wireless message received, the robot is ready to go.")
+        self.get_logger().info(
+            "Low state, wireless controller, and depth input received."
+        )
+
+    def _motion_response_callback(self, message):
+        self.motion_responses.append(message)
+
+    def consume_button_rising(self, button):
+        pressed = bool(self.remote_rising_edges & int(button))
+        self.remote_rising_edges &= ~int(button)
+        return pressed
+
+    def _call_motion_switcher(self, api_id):
+        if self.dryrun or self.motion_request_pub is None:
+            raise RealControlError("MotionSwitcher is unavailable in dry-run")
+        reason = "timed out"
+        for _ in range(RPC_MAX_ATTEMPTS):
+            request_id = time.monotonic_ns()
+            request = build_motion_request(Request(), api_id, request_id)
+            self.motion_responses.clear()
+            self.motion_request_pub.publish(request)
+            deadline = time.monotonic() + RPC_TIMEOUT_S
+            while rclpy.ok() and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                matching = [
+                    response
+                    for response in self.motion_responses
+                    if int(response.header.identity.id) == request_id
+                    and int(response.header.identity.api_id) == int(api_id)
+                ]
+                self.motion_responses.clear()
+                if matching:
+                    return parse_motion_response(
+                        matching[-1],
+                        request_id,
+                        api_id,
+                    )
+            reason = "timed out"
+        raise RealControlError(
+            f"MotionSwitcher API {api_id} failed after "
+            f"{RPC_MAX_ATTEMPTS} attempts: {reason}"
+        )
+
+    def _current_joint_state(self):
+        position = self.dof_pos_[0].detach().cpu().numpy().astype(np.float64)
+        velocity = self.dof_vel_[0].detach().cpu().numpy().astype(np.float64)
+        return position, velocity
+
+    def _validate_takeover_now(self, now):
+        if self.latest_low_state_time is None or self.latest_remote_time is None:
+            raise RealControlError("LowState and remote input are required")
+        position, velocity = self._current_joint_state()
+        validate_takeover_inputs(
+            position,
+            velocity,
+            now - self.latest_low_state_time,
+            now - self.latest_remote_time,
+        )
+
+    def _wait_for_l1_takeover_hold(self):
+        self.get_logger().warning(
+            "Release L1, then hold it continuously for one second to authorize "
+            "Sport Mode release and real /lowcmd takeover."
+        )
+        while rclpy.ok() and (self.remote_keys & self.WirelessButtons.L1):
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        hold_started = None
+        last_reason = None
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.02)
+            now = time.monotonic()
+            l1_pressed = bool(self.remote_keys & self.WirelessButtons.L1)
+            if not l1_pressed:
+                hold_started = None
+                continue
+            try:
+                self._validate_takeover_now(now)
+            except RealControlError as error:
+                hold_started = None
+                reason = str(error)
+                if reason != last_reason:
+                    self.get_logger().warning(
+                        f"L1 takeover hold reset: {reason}"
+                    )
+                    last_reason = reason
+                continue
+            last_reason = None
+            if hold_started is None:
+                hold_started = now
+            if now - hold_started >= TAKEOVER_HOLD_S:
+                return
+        raise RealControlError("ROS shutdown before takeover authorization")
+
+    def _wait_for_external_lowcmd_clear(self):
+        gate = PublisherClearGate(time.monotonic())
+        while rclpy.ok():
+            publishers = self.get_publishers_info_by_topic(
+                REAL_LOW_COMMAND_TOPIC
+            )
+            try:
+                publishers_clear = gate.observe(
+                    len(publishers),
+                    time.monotonic(),
+                )
+            except RealControlError as error:
+                details = "; ".join(
+                    describe_publisher_endpoint(endpoint)
+                    for endpoint in publishers
+                )
+                if details:
+                    raise RealControlError(
+                        f"{error}; remaining publishers: {details}"
+                    ) from error
+                raise
+            if publishers_clear:
+                validate_low_command_boundary(True, len(publishers))
+                return
+            rclpy.spin_once(self, timeout_sec=0.05)
+        raise RealControlError("ROS shutdown while waiting for /lowcmd ownership")
+
+    def prepare_real_takeover(self):
+        """Release Sport Mode and create /lowcmd only after all gates pass."""
+        if self.dryrun:
+            return
+        if self.real_control_phase != "sport":
+            raise RealControlError("real takeover was already attempted")
+
+        active_mode = str(
+            self._call_motion_switcher(CHECK_MODE_API_ID).get("name", "")
+        )
+        self.get_logger().info(
+            f"MotionSwitcher active mode: '{active_mode or 'none'}'."
+        )
+        self._wait_for_l1_takeover_hold()
+        self._validate_takeover_now(time.monotonic())
+
+        active_mode = str(
+            self._call_motion_switcher(CHECK_MODE_API_ID).get("name", "")
+        )
+        release_cycles = 0
+        while release_mode_required(active_mode):
+            if release_cycles >= RPC_MAX_ATTEMPTS:
+                raise RealControlError(
+                    "Sport Mode remained active after ReleaseMode retries"
+                )
+            self._call_motion_switcher(RELEASE_MODE_API_ID)
+            release_cycles += 1
+            active_mode = str(
+                self._call_motion_switcher(CHECK_MODE_API_ID).get("name", "")
+            )
+        if release_cycles == 0:
+            self.get_logger().info(
+                "MotionSwitcher was already released; skipped ReleaseMode."
+            )
+        else:
+            self.get_logger().warning("Sport Mode release verified.")
+
+        self._wait_for_external_lowcmd_clear()
+        self.low_cmd_pub = self.create_publisher(
+            LowCmd,
+            REAL_LOW_COMMAND_TOPIC,
+            1,
+        )
+        self.low_cmd_buffer = LowCmd()
+        position, _ = self._current_joint_state()
+        self.startup_ramp_start_q = position.copy()
+        self.startup_ramp_start_time = time.monotonic()
+        self.last_command_target_q = position.copy()
+        self.real_control_phase = "startup_ramp"
+        self._publish_legs_cmd(
+            torch.as_tensor(position, device=self.model_device),
+            stand=True,
+        )
+        self.get_logger().warning(
+            "This process exclusively owns /lowcmd. Starting the 3-second "
+            "measured-pose ramp."
+        )
+
+    def begin_policy_transition(self):
+        if self.dryrun:
+            return True
+        if self.real_control_phase != "stand_hold":
+            self.get_logger().warning(
+                "Policy request ignored until the startup stand ramp completes."
+            )
+            return False
+        start = self.last_command_target_q
+        if start is None:
+            raise RealControlError("stand target is unavailable")
+        self.policy_transition.begin(start, time.monotonic())
+        self.real_control_phase = "policy"
+        return True
+
+    def begin_stand_recovery(self):
+        if self.dryrun:
+            return
+        start = self.last_command_target_q
+        if start is None:
+            start, _ = self._current_joint_state()
+        self.stand_recovery_start_q = np.asarray(start, dtype=np.float64).copy()
+        self.stand_recovery_start_time = time.monotonic()
+        self.policy_transition.reset()
+        self.real_control_phase = "stand_recovery"
 
     """ ROS callbacks and handlers that update the buffer """
 
@@ -355,6 +614,7 @@ class UnitreeRos2Real(Node):
         # self.get_logger().warn("Low state message received.")
         """ store and handle proprioception data """
         self.low_state_buffer = msg # keep the latest low state
+        self.latest_low_state_time = time.monotonic()
 
         ################### refresh dof_pos and dof_vel ######################
         for sim_idx in range(self.NUM_DOF):
@@ -367,6 +627,10 @@ class UnitreeRos2Real(Node):
     def _joy_stick_callback(self, msg):
         # self.get_logger().warn("Wireless controller message received.")
         self.joy_stick_buffer = msg
+        keys = int(msg.keys)
+        self.remote_rising_edges |= keys & ~self.remote_keys
+        self.remote_keys = keys
+        self.latest_remote_time = time.monotonic()
         if self.move_by_wireless_remote:
             # left-y for forward/backward
             ly = msg.ly
@@ -428,9 +692,19 @@ class UnitreeRos2Real(Node):
 
     def _depth_data_callback(self, msg):
         self.depth_data = torch.tensor(msg.data, dtype=torch.float32).reshape(1, 58, 87).to(self.model_device)
+        self.latest_depth_time = time.monotonic()
 
     
     def _sport_mode_change(self, mode):
+        if self.dryrun:
+            self.get_logger().warn(
+                "Dry-run blocked a Sport Mode API request.",
+                once=True,
+            )
+            return False
+        if self.sport_mode_pub is None:
+            raise RuntimeError("Sport Mode publisher is not initialized.")
+
         msg = Request()
 
         msg.header.identity.id = 0
@@ -443,8 +717,18 @@ class UnitreeRos2Real(Node):
         msg.binary = []
 
         self.sport_mode_pub.publish(msg)
+        return True
     
     def _sport_state_change(self, mode):
+        if self.dryrun:
+            self.get_logger().warn(
+                "Dry-run blocked a robot-state API request.",
+                once=True,
+            )
+            return False
+        if self.sport_state_pub is None:
+            raise RuntimeError("Robot-state publisher is not initialized.")
+
         msg = Request()
 
         # Fill the header
@@ -463,6 +747,7 @@ class UnitreeRos2Real(Node):
 
         # Publish the request
         self.sport_state_pub.publish(msg)
+        return True
 
     """ Done: ROS callbacks and handlers that update the buffer """
 
@@ -508,11 +793,11 @@ class UnitreeRos2Real(Node):
         return self.actions
 
     def _get_contact_filt_obs(self):
-        for i in range(4):
-            if self.low_state_buffer.foot_force[i] < 25:
-                self.contact_filt[:, i] = -0.5
+        for sim_idx, real_idx in enumerate(FOOT_REAL_TO_SIM):
+            if self.low_state_buffer.foot_force[real_idx] < 25:
+                self.contact_filt[:, sim_idx] = -0.5
             else:
-                self.contact_filt[:, i] = 0.5
+                self.contact_filt[:, sim_idx] = 0.5
         return self.contact_filt
 
     def _get_depth_image(self):
@@ -601,6 +886,20 @@ class UnitreeRos2Real(Node):
         clipped_scaled_action = torch.clip(actions, -hard_clip, hard_clip) * self.cfg["control"]["action_scale"]
         
         robot_coordinates_action = clipped_scaled_action + self.default_dof_pos.unsqueeze(0)
+        if not self.dryrun:
+            if self.real_control_phase != "policy":
+                raise RealControlError(
+                    "policy output is blocked outside the policy phase"
+                )
+            guarded = self.policy_transition.apply(
+                robot_coordinates_action[0].detach().cpu().numpy(),
+                time.monotonic(),
+            )
+            robot_coordinates_action = torch.as_tensor(
+                guarded,
+                dtype=torch.float32,
+                device=self.model_device,
+            ).unsqueeze(0)
         self._publish_legs_cmd(robot_coordinates_action[0], stand=False)
 
     def send_stand_action(self, actions):
@@ -614,9 +913,63 @@ class UnitreeRos2Real(Node):
         self._publish_legs_cmd(actions[0], stand=True)
 
     def get_stand_action(self):
+        if not self.dryrun:
+            now = time.monotonic()
+            target = self.default_dof_pos.detach().cpu().numpy().astype(np.float64)
+            if self.real_control_phase == "startup_ramp":
+                if (
+                    self.startup_ramp_start_time is None
+                    or self.startup_ramp_start_q is None
+                ):
+                    raise RealControlError("startup ramp state is missing")
+                elapsed = now - self.startup_ramp_start_time
+                result = interpolate_pose(
+                    self.startup_ramp_start_q,
+                    target,
+                    elapsed,
+                    STARTUP_RAMP_S,
+                )
+                if elapsed >= STARTUP_RAMP_S:
+                    self.real_control_phase = "stand_hold"
+                    self.get_logger().warning(
+                        "Startup ramp complete; holding the policy default pose. "
+                        "Press Y once to enter policy control."
+                    )
+                return result.tolist()
+            if self.real_control_phase == "stand_recovery":
+                if (
+                    self.stand_recovery_start_time is None
+                    or self.stand_recovery_start_q is None
+                ):
+                    raise RealControlError("stand recovery state is missing")
+                elapsed = now - self.stand_recovery_start_time
+                result = interpolate_pose(
+                    self.stand_recovery_start_q,
+                    target,
+                    elapsed,
+                    1.0,
+                )
+                if elapsed >= 1.0:
+                    self.real_control_phase = "stand_hold"
+                    self.stand_recovery_start_time = None
+                    self.stand_recovery_start_q = None
+                    self.get_logger().warning(
+                        "Policy exited; holding the policy default pose."
+                    )
+                return result.tolist()
+            if self.real_control_phase == "stand_hold":
+                return target.tolist()
+            raise RealControlError(
+                f"stand output is blocked in phase '{self.real_control_phase}'"
+            )
+
         if self.firstRun:
-            for i in range(12):
-                self.startPos[i] = self.low_state_buffer.motor_state[i].q
+            for sim_idx in range(self.NUM_DOF):
+                real_idx = self.dof_map[sim_idx]
+                self.startPos[sim_idx] = (
+                    self.low_state_buffer.motor_state[real_idx].q
+                    * self.dof_signs[sim_idx]
+                )
             self.firstRun = False
 
         self.percent_1 += 1.0 / self.duration_1
@@ -644,6 +997,12 @@ class UnitreeRos2Real(Node):
         """ Publish the joint commands to the robot legs in robot coordinates system.
         robot_coordinates_action: shape (NUM_DOF,), in simulation order.
         """
+        if self.low_cmd_pub is None or self.low_cmd_buffer is None:
+            raise RealControlError("/lowcmd publisher is not initialized")
+        target = robot_coordinates_action.detach().cpu().numpy()
+        if target.shape != (12,) or not np.isfinite(target).all():
+            raise RealControlError("joint command must contain 12 finite values")
+
         #################### check ##############################
         for sim_idx in range(self.NUM_DOF):
             real_idx = self.dof_map[sim_idx]
@@ -657,9 +1016,12 @@ class UnitreeRos2Real(Node):
         
         self.low_cmd_buffer.crc = get_crc(self.low_cmd_buffer)
         self.low_cmd_pub.publish(self.low_cmd_buffer)
+        self.last_command_target_q = target.astype(np.float64).copy()
 
     def _turn_off_motors(self):
         """ Turn off the motors """
+        if self.low_cmd_pub is None or self.low_cmd_buffer is None:
+            return
         for sim_idx in range(self.NUM_DOF):
             real_idx = self.dof_map[sim_idx]
             self.low_cmd_buffer.motor_cmd[real_idx].mode = 0x00
@@ -670,4 +1032,12 @@ class UnitreeRos2Real(Node):
             self.low_cmd_buffer.motor_cmd[real_idx].kd = 0.
         self.low_cmd_buffer.crc = get_crc(self.low_cmd_buffer)
         self.low_cmd_pub.publish(self.low_cmd_buffer)
+
+    def shutdown_outputs(self):
+        """Publish a short all-motors-off tail before destroying a real node."""
+        if self.dryrun or self.low_cmd_pub is None:
+            return
+        for _ in range(10):
+            self._turn_off_motors()
+            time.sleep(0.02)
     """ Done: functions that actually publish the commands and take effect """

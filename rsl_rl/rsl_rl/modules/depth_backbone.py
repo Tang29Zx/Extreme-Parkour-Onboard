@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import sys
-import torchvision
 
 class RecurrentDepthBackbone(nn.Module):
     def __init__(self, base_backbone, env_cfg) -> None:

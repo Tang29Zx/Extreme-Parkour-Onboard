@@ -1,28 +1,16 @@
 import rclpy
-from rclpy.node import Node
 from unitree_ros2_real import UnitreeRos2Real, get_euler_xyz
 
 import os
-import ast
 import os.path as osp
 import json
 import time
 from collections import OrderedDict
-from copy import deepcopy
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.autograd import Variable
 from torch import nn
 
-from rsl_rl import modules
-from rsl_rl.modules import StateHistoryEncoder, RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
-import cv2
-
-import sys
-import time
-import sys
-import threading
+from rsl_rl.modules import RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
 
 from sport_api_constants import *
 
@@ -87,19 +75,41 @@ class Go2Node(UnitreeRos2Real):
         )
         
     def main_loop(self):
+        r1_pressed = self.consume_button_rising(self.WirelessButtons.R1)
+        r2_pressed = self.consume_button_rising(self.WirelessButtons.R2)
+        x_pressed = self.consume_button_rising(self.WirelessButtons.X)
+        l1_pressed = self.consume_button_rising(self.WirelessButtons.L1)
+        y_pressed = self.consume_button_rising(self.WirelessButtons.Y)
+        l2_pressed = self.consume_button_rising(self.WirelessButtons.L2)
+
+        if (
+            not self.dryrun
+            and self.real_control_phase not in ("sport", "dryrun")
+            and r2_pressed
+        ):
+            self.get_logger().error(
+                "R2 emergency stop: publishing the motor-off tail."
+            )
+            self.shutdown_outputs()
+            self.real_control_phase = "emergency_stop"
+            self.use_stand_policy = False
+            self.use_parkour_policy = False
+            self.use_sport_mode = False
+            return
+
         if self.use_sport_mode:
-            if (self.joy_stick_buffer.keys & self.WirelessButtons.R1):
+            if r1_pressed:
                 self.get_logger().info("In the sport mode, R1 pressed, robot will stand up.")
                 self._sport_mode_change(ROBOT_SPORT_API_ID_STANDUP)
-            if (self.joy_stick_buffer.keys & self.WirelessButtons.R2):
+            if r2_pressed:
                 self.get_logger().info("In the sport mode, R2 pressed, robot will sit down.")
                 self._sport_mode_change(ROBOT_SPORT_API_ID_STANDDOWN)
 
-            if (self.joy_stick_buffer.keys & self.WirelessButtons.X):
+            if x_pressed:
                 self.get_logger().info("In the sport mode, X pressed, robot will balance stand.")
                 self._sport_mode_change(ROBOT_SPORT_API_ID_BALANCESTAND)
 
-            if (self.joy_stick_buffer.keys & self.WirelessButtons.L1):
+            if l1_pressed and self.dryrun:
                 self.get_logger().info("Exist the sport mode. Switch to stand policy.")
                 self.use_sport_mode = False
                 self._sport_state_change(0)
@@ -110,12 +120,13 @@ class Go2Node(UnitreeRos2Real):
             stand_action = self.get_stand_action()
             self.send_stand_action(stand_action)
         
-        if (self.joy_stick_buffer.keys & self.WirelessButtons.Y):
-            self.get_logger().info("Y pressed, use the parkour policy")
-            self.use_stand_policy = False
-            self.use_parkour_policy = True
-            self.use_sport_mode = False
-            self.global_counter = 0
+        if y_pressed:
+            if self.begin_policy_transition():
+                self.get_logger().info("Y pressed, use the parkour policy")
+                self.use_stand_policy = False
+                self.use_parkour_policy = True
+                self.use_sport_mode = False
+                self.global_counter = 0
 
         if self.use_parkour_policy:
             self.use_stand_policy = False
@@ -167,14 +178,25 @@ class Go2Node(UnitreeRos2Real):
 
             self.global_counter += 1
 
-        if (self.joy_stick_buffer.keys & self.WirelessButtons.L2):
-            self.get_logger().info("L2 pressed, stop using parkour policy, switch to sport mode.")
-            self.use_stand_policy = False
-            self.use_parkour_policy = False
-            self.use_sport_mode = True
+        if l2_pressed:
             self.reset_obs()
-            self._sport_state_change(1)
-            self._sport_mode_change(ROBOT_SPORT_API_ID_BALANCESTAND)
+            if self.dryrun:
+                self.get_logger().info(
+                    "L2 pressed, stop using parkour policy, switch to sport mode."
+                )
+                self.use_stand_policy = False
+                self.use_parkour_policy = False
+                self.use_sport_mode = True
+                self._sport_state_change(1)
+                self._sport_mode_change(ROBOT_SPORT_API_ID_BALANCESTAND)
+            elif self.real_control_phase == "policy":
+                self.get_logger().warning(
+                    "L2 pressed: leaving policy through the one-second stand ramp."
+                )
+                self.begin_stand_recovery()
+                self.use_stand_policy = True
+                self.use_parkour_policy = False
+                self.use_sport_mode = False
 
 
 @torch.inference_mode()
@@ -254,23 +276,36 @@ def main(args):
     env_node.register_models(turn_obs=turn_obs, depth_encode=encode_depth, policy=actor_model)
 
 
-    env_node.start_ros_handlers()
-    env_node.warm_up()
+    try:
+        env_node.start_ros_handlers()
+        env_node.warm_up()
+        if args.nodryrun:
+            env_node.prepare_real_takeover()
+            env_node.use_sport_mode = False
+            env_node.use_stand_policy = True
+            env_node.use_parkour_policy = False
 
-    if args.loop_mode == "while":
-        rclpy.spin_once(env_node, timeout_sec= 0.)
-        env_node.get_logger().info("Model and Policy are ready")
-        while rclpy.ok():
-            main_loop_time = time.monotonic()
-            env_node.main_loop()
-            rclpy.spin_once(env_node, timeout_sec= 0.)
-            time.sleep(max(0, duration - (time.monotonic() - main_loop_time)))
-    elif args.loop_mode == "timer":
-        env_node.get_logger().info('Model and Policy are ready')
-        env_node.start_main_loop_timer(duration)
-        rclpy.spin(env_node)
-
-    rclpy.shutdown()
+        if args.loop_mode == "while":
+            rclpy.spin_once(env_node, timeout_sec=0.0)
+            env_node.get_logger().info("Model and Policy are ready")
+            while rclpy.ok():
+                main_loop_time = time.monotonic()
+                env_node.main_loop()
+                rclpy.spin_once(env_node, timeout_sec=0.0)
+                time.sleep(
+                    max(0, duration - (time.monotonic() - main_loop_time))
+                )
+        elif args.loop_mode == "timer":
+            env_node.get_logger().info("Model and Policy are ready")
+            env_node.start_main_loop_timer(duration)
+            rclpy.spin(env_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        env_node.shutdown_outputs()
+        env_node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

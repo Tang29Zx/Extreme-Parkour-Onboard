@@ -39,35 +39,35 @@
         "max_curriculum": 1.0,
         "max_ranges": {
             "ang_vel_yaw": [
-                0,
-                0
+                0.0,
+                0.0
             ],
             "heading": [
-                -1.6,
-                1.6
+                0.0,
+                0.0
             ],
             "lin_vel_x": [
-                0.3,
-                0.8
+                0.5,
+                0.5
             ],
             "lin_vel_y": [
-                -0.3,
-                0.3
+                0.0,
+                0.0
             ]
         },
         "num_commands": 4,
         "ranges": {
             "ang_vel_yaw": [
-                0,
-                0
+                0.0,
+                0.0
             ],
             "heading": [
-                0,
-                0
+                0.0,
+                0.0
             ],
             "lin_vel_x": [
-                0.0,
-                1.5
+                0.5,
+                0.5
             ],
             "lin_vel_y": [
                 0.0,
@@ -85,7 +85,7 @@
         },
         "decimation": 4,
         "stiffness": {
-            "joint": 40
+            "joint": 40.0
         }
     },
     "depth": {
@@ -95,29 +95,63 @@
         ],
         "buffer_len": 2,
         "camera_num_envs": 192,
-        "camera_terrain_num_cols": 20,
+        "camera_terrain_num_cols": 40,
         "camera_terrain_num_rows": 10,
-        "dis_noise": 0.0,
+        "depth_dropout_prob": 0.01,
+        "depth_occlusion_prob": 0.3,
+        "depth_occlusion_size_range": [
+            0.05,
+            0.15
+        ],
+        "dis_noise": 0.02,
         "far_clip": 2,
-        "horizontal_fov": 87,
+        "far_distance_dropout_prob": 0.0,
+        "far_distance_gaussian_std": 0.0,
+        "far_distance_noise_start": 0.0,
+        "gaussian_noise_std": 0.01,
+        "horizontal_fov": [
+            86,
+            90
+        ],
         "invert": true,
         "near_clip": 0,
+        "near_plane": 0.1,
         "original": [
             106,
             60
         ],
-        "position": [
-            0.24,
-            0,
-            0.12
-        ],
+        "position": {
+            "mean": [
+                0.355,
+                0.0,
+                0.065
+            ],
+            "std": [
+                0.015,
+                0.01,
+                0.015
+            ]
+        },
         "resized": [
             87,
             58
         ],
+        "rotation": {
+            "lower": [
+                -0.0349066,
+                0.349066,
+                -0.0349066
+            ],
+            "upper": [
+                0.0349066,
+                0.436332,
+                0.0349066
+            ]
+        },
         "scale": 1,
         "update_interval": 5,
-        "use_camera": false
+        "use_camera": false,
+        "use_gpu_tensor": true
     },
     "domain_rand": {
         "action_buf_len": 8,
@@ -129,35 +163,43 @@
             0,
             1
         ],
-        "action_delay": false,
+        "action_delay": true,
+        "action_delay_range": [
+            0,
+            2
+        ],
         "action_delay_view": 1,
         "added_com_range": [
-            -0.2,
-            0.2
+            -0.03,
+            0.03
         ],
         "added_mass_range": [
-            0.0,
-            3.0
+            -0.5,
+            1.5
         ],
         "delay_update_global_steps": 192000,
         "friction_range": [
-            0.6,
-            2.0
+            0.7,
+            1.3
         ],
-        "max_push_vel_xy": 0.5,
+        "max_push_vel_xy": 0.2,
         "motor_strength_range": [
-            0.8,
-            1.2
+            0.9,
+            1.1
         ],
-        "push_interval_s": 6,
-        "push_robots": false,
-        "randomize_base_com": false,
-        "randomize_base_mass": false,
+        "push_interval_s": 8.0,
+        "push_robots": true,
+        "randomize_base_com": true,
+        "randomize_base_mass": true,
         "randomize_friction": true,
         "randomize_motor": true
     },
     "env": {
         "contact_buf_len": 100,
+        "dof_pos_reset_range": [
+            -0.05,
+            0.05
+        ],
         "env_spacing": 3.0,
         "episode_length_s": 60,
         "history_encoding": true,
@@ -169,22 +211,26 @@
         "n_scan": 132,
         "next_goal_threshold": 0.2,
         "num_actions": 12,
-        "num_envs": 5,
+        "num_envs": 10,
         "num_future_goal_obs": 2,
         "num_observations": 753,
         "num_privileged_obs": null,
         "obs_type": "og",
         "rand_pitch_range": 1.6,
         "rand_y_range": 0.5,
-        "rand_yaw_range": 1.2,
+        "rand_yaw_range": 0.05,
         "randomize_start_pitch": false,
-        "randomize_start_pos": false,
+        "randomize_start_pos": true,
         "randomize_start_vel": false,
         "randomize_start_y": false,
-        "randomize_start_yaw": false,
+        "randomize_start_yaw": true,
         "reach_goal_delay": 0.1,
         "reorder_dofs": true,
-        "send_timeouts": true
+        "send_timeouts": true,
+        "start_pos_range": [
+            0.05,
+            0.05
+        ]
     },
     "init_member_classes": {},
     "init_state": {
@@ -263,15 +309,18 @@
     },
     "noise": {
         "add_noise": true,
+        "apply_observation_noise": true,
+        "contact_dropout_prob": 0.01,
         "noise_level": 1.0,
         "noise_scales": {
-            "ang_vel": 0.05,
+            "ang_vel": 0.06,
             "dof_pos": 0.01,
-            "dof_vel": 0.05,
+            "dof_vel": 0.45,
+            "goal_yaw": 0.02,
             "gravity": 0.02,
-            "height_measurements": 0.02,
+            "height_measurements": 0.03,
             "lin_vel": 0.05,
-            "rotation": 0.0
+            "rotation": 0.015
         },
         "quantize_height": true
     },
@@ -351,18 +400,20 @@
             0.1
         ],
         "height": [
-            0.02,
-            0.02
+            0.0,
+            0.0
         ],
-        "hf2mesh_method": "grid",
+        "hf2mesh_method": "fast",
         "horizontal_scale": 0.05,
-        "horizontal_scale_camera": 0.1,
-        "max_difficulty": true,
-        "max_error": 0.1,
-        "max_error_camera": 2,
-        "max_init_terrain_level": 5,
+        "horizontal_scale_camera": 0.05,
+        "max_difficulty": false,
+        "max_error": 0.01,
+        "max_error_camera": 0.01,
+        "max_init_terrain_level": 9,
         "measure_heights": true,
         "measure_horizontal_noise": 0.0,
+        "measure_horizontal_offset": 0.02,
+        "measure_point_jitter": 0.01,
         "measured_points_x": [
             -0.45,
             -0.3,
@@ -392,10 +443,74 @@
         ],
         "mesh_type": "trimesh",
         "no_flat": true,
-        "num_cols": 5,
-        "num_goals": 8,
-        "num_rows": 5,
+        "num_cols": 40,
+        "num_goals": 7,
+        "num_rows": 10,
         "origin_zero_z": true,
+        "preserve_custom_terrain_with_camera": true,
+        "random_box_kwargs": {
+            "seed": 0,
+            "num_unique_layouts": 400,
+            "box_count_range": [
+                2,
+                6
+            ],
+            "spawn_margin": 0.6,
+            "first_runup_range": [
+                1.0,
+                1.5
+            ],
+            "height_range": [
+                0.1,
+                0.5
+            ],
+            "length_range": [
+                0.8,
+                1.5
+            ],
+            "width_range": [
+                0.8,
+                1.5
+            ],
+            "lateral_offset_range": [
+                -1.0,
+                1.0
+            ],
+            "gap_distributions": [
+                {
+                    "range": [
+                        0.1,
+                        1.5
+                    ],
+                    "weight": 1.0
+                }
+            ],
+            "ground_roughness_distributions": [
+                {
+                    "range": [
+                        0.0,
+                        0.0
+                    ],
+                    "weight": 0.3
+                },
+                {
+                    "range": [
+                        0.0,
+                        0.02
+                    ],
+                    "weight": 0.5
+                },
+                {
+                    "range": [
+                        0.02,
+                        0.06
+                    ],
+                    "weight": 0.2
+                }
+            ],
+            "exit_goal_distance": 1.0,
+            "end_margin": 0.5
+        },
         "restitution": 0.0,
         "selected": false,
         "simplify_grid": false,
@@ -414,21 +529,23 @@
             "discrete": 0.0,
             "stepping stones": 0.0,
             "gaps": 0.0,
-            "smooth flat": 0,
+            "smooth flat": 0.0,
             "pit": 0.0,
             "wall": 0.0,
             "platform": 0.0,
             "large stairs up": 0.0,
             "large stairs down": 0.0,
-            "parkour": 0.2,
-            "parkour_hurdle": 0.2,
+            "parkour": 0.0,
+            "parkour_hurdle": 0.0,
             "parkour_flat": 0.0,
-            "parkour_step": 0.2,
-            "parkour_gap": 0.2,
-            "demo": 0.2
+            "parkour_step": 0.0,
+            "parkour_gap": 0.0,
+            "demo": 0.0,
+            "five_box": 0.0,
+            "random_box": 1.0
         },
         "terrain_kwargs": null,
-        "terrain_length": 18.0,
+        "terrain_length": 25.0,
         "terrain_proportions": [
             0.0,
             0.0,
@@ -438,20 +555,22 @@
             0.0,
             0.0,
             0.0,
-            0,
             0.0,
             0.0,
             0.0,
             0.0,
             0.0,
-            0.2,
-            0.2,
             0.0,
-            0.2,
-            0.2,
-            0.2
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
         ],
-        "terrain_width": 4,
+        "terrain_width": 4.0,
         "vertical_scale": 0.005,
         "y_range": [
             -0.4,
@@ -460,14 +579,14 @@
     },
     "viewer": {
         "lookat": [
-            11.0,
-            5,
-            3.0
+            9.0,
+            0.0,
+            0.4
         ],
         "pos": [
-            10,
-            0,
-            6
+            5.0,
+            -7.0,
+            4.0
         ],
         "ref_env": 0
     }
