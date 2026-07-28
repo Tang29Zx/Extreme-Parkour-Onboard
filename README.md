@@ -74,6 +74,8 @@ CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命�
   误差不超过0.2 rad且12个电机`lost`计数没有继续增长；历史非零计数允许通过。
   prime只要求LowState和深度持续新鲜，按Y瞬间才检查遥控器。不满足时保持站姿并
   打印拒绝原因；电机温度只写入飞行记录，不阻止进入策略。
+- prime完成后等待Y期间仍以50 Hz观察累计`lost`计数；发现增长会立即自动重新prime，
+  连续稳定0.5秒后重新接受Y，不会把几分钟前已经稳定的增长延迟到按Y时才拒绝。
 - 短按并释放 **Y** 进入策略；前1秒以五次曲线接入且每周期最多变化0.05 rad，
   第1秒相对起点还限制在0.3 rad以内。接入完成后以0.10 rad/周期持续限制目标变化、机械
   关节范围和估算PD力矩；策略观测中的`last_actions`保持上一帧actor原始输出。
@@ -88,6 +90,21 @@ CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命�
 - `--flight-log-dir`可指定飞行记录目录，默认`~/extreme-flight-logs`；L2、R2、
   异常或退出时会保存最近5秒数据并在日志中打印文件路径。记录包含12电机温度、
   `lost`、估算力矩和四足接触判定。
+
+控制节点运行后，可在第三个终端只读查看2 Hz实时状态：
+
+```bash
+cd ~/Extreme-Parkour-Onboard
+source scripts/jetson_env.sh
+python3 scripts/read_runtime_status.py
+```
+
+输出同时包含`unitree_ros2_real`的实时`/rosout`事件；状态单行包含控制阶段、真实
+输出授权、策略接入状态、LowState/遥控器/深度年龄、机身roll/pitch、四足接触、
+关节跟踪误差、最大温度、`lost`计数、力矩比例和控制周期。使用`--json`查看完整
+12关节数组。该脚本只订阅
+`/extreme_parkour/runtime_status`和`/rosout`，不创建控制publisher，也不代替退出时
+保存的NPZ飞行记录。控制节点使用其他logger名称时通过`--logger-name`指定。
 
 ## Notes and Tips
 
@@ -134,6 +151,9 @@ export PARKOUR_RESOURCES_DIR=/home/tang/extreme-parkour-go2/legged_gym/resources
 EXTREME_REPLAY_STEPS=1000 \
 EXTREME_BOUNDARY_COMPARISON=abc \
 EXTREME_BOUNDARY_GUARDS=full \
+EXTREME_GROUND_NOISE_M=0.005 \
+EXTREME_GROUND_NOISE_PATCH_M=0.2 \
+EXTREME_GROUND_NOISE_SEED=17 \
 /home/tang/miniconda3/envs/hybrik/bin/python \
   legged_gym/scripts/replay_unitree_boundary.py \
   --task go2 --device cpu --pipeline cpu
@@ -144,6 +164,10 @@ EXTREME_BOUNDARY_GUARDS=full \
 隔离顺序、观测和LowCmd往返问题，不能代表真机安全链。默认`full`会执行生产端每周期
 输入检查、接入期0.05 rad/周期、稳态0.10 rad/周期、机械限位和估算PD力矩约束。
 关节速度检查对URDF标称上限保留0.5%测量容差，超出该容差仍会停止策略。
+回放使用与生产端相同的遥控器上升沿逻辑，自动注入一次L1和一次Y；L1前不授权
+LowCmd，Y只能在3秒站姿和0.5秒prime完成后生效。`EXTREME_GROUND_NOISE_M`控制
+物理高度场的对称噪声幅度，噪声块尺寸和随机种子分别由
+`EXTREME_GROUND_NOISE_PATCH_M`、`EXTREME_GROUND_NOISE_SEED`设置。
 
 每次运行都会在`~/extreme-boundary-s2s`保存无pickle NPZ；可用
 `EXTREME_BOUNDARY_LOG_DIR`覆盖目录。日志同时包含actor、Unitree motor和Isaac顺序、
@@ -154,6 +178,11 @@ EXTREME_BOUNDARY_GUARDS=full \
 `x=3.40 m`，结果为PASS；接入期最大目标变化0.05 rad、稳态0.10 rad、最大估算
 力矩比例0.8535，且无reset、保护故障或LowCmd/PhysX目标差异。三路`abc/full`回放也在
 第426步由绿色B完成，红色C因旧二次重排造成入口跟踪误差而保持站姿。
+
+2026-07-28进一步使用±5 mm、0.2 m噪声块和种子17运行模拟遥控完整链：L1在第5步
+接管，第183步Y通过，绿色边界第422步到达`x=3.4076 m`。结果为PASS，0 reset、
+0 fault，接入/稳态最大目标变化0.05/0.10 rad，最大估算力矩比例0.8812。
+
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
 
 ## Performance 

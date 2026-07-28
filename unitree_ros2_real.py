@@ -36,6 +36,7 @@ from real_control_safety import (
     LowStateStaleError,
     PolicyPrimeGate,
     PolicyTransitionGuard,
+    RemoteEdgeTracker,
     RealControlError,
     build_motion_request,
     constrain_policy_target,
@@ -45,6 +46,7 @@ from real_control_safety import (
     parse_motion_response,
     prepare_policy_action,
     release_mode_required,
+    update_motor_lost_baseline,
     validate_policy_prime_inputs,
     validate_policy_runtime_inputs,
     validate_policy_request_input,
@@ -206,6 +208,7 @@ class UnitreeRos2Real(Node):
         self.latest_depth_time = None
         self.remote_keys = 0
         self.remote_rising_edges = 0
+        self.remote_tracker = RemoteEdgeTracker()
         self.real_control_phase = "dryrun" if dryrun else "sport"
         self.startup_ramp_start_time = None
         self.startup_ramp_start_q = None
@@ -465,8 +468,8 @@ class UnitreeRos2Real(Node):
         self.motion_responses.append(message)
 
     def consume_button_rising(self, button):
-        pressed = bool(self.remote_rising_edges & int(button))
-        self.remote_rising_edges &= ~int(button)
+        pressed = self.remote_tracker.consume_rising(button)
+        self.remote_rising_edges = self.remote_tracker.rising_edges
         return pressed
 
     def _call_motion_switcher(self, api_id):
@@ -551,6 +554,28 @@ class UnitreeRos2Real(Node):
             )
         finally:
             self.policy_lost_baseline = lost.copy()
+
+    def monitor_stand_hold_motor_lost(self):
+        """Re-prime immediately when a lost counter advances while waiting for Y."""
+        if self.real_control_phase != "stand_hold":
+            return True
+        _, lost = self._current_motor_diagnostics()
+        if self.policy_lost_baseline is None:
+            self.policy_lost_baseline = lost.copy()
+            return True
+        baseline, increased = update_motor_lost_baseline(
+            lost,
+            self.policy_lost_baseline,
+        )
+        self.policy_lost_baseline = baseline
+        if not increased.size:
+            return True
+        self.get_logger().warning(
+            "Motor lost counters increased while waiting for Y at indices "
+            f"{increased.tolist()}; rebuilding policy context now."
+        )
+        self.begin_policy_prime()
+        return False
 
     def _validate_takeover_now(self, now):
         if self.latest_low_state_time is None or self.latest_remote_time is None:
@@ -856,9 +881,10 @@ class UnitreeRos2Real(Node):
         # self.get_logger().warn("Wireless controller message received.")
         self.joy_stick_buffer = msg
         keys = int(msg.keys)
-        self.remote_rising_edges |= keys & ~self.remote_keys
-        self.remote_keys = keys
-        self.latest_remote_time = time.monotonic()
+        self.remote_tracker.update(keys, time.monotonic())
+        self.remote_keys = self.remote_tracker.keys
+        self.remote_rising_edges = self.remote_tracker.rising_edges
+        self.latest_remote_time = self.remote_tracker.latest_time
         if self.move_by_wireless_remote:
             # left-y for forward/backward
             ly = msg.ly

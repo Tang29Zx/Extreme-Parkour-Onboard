@@ -1,15 +1,29 @@
 import unittest
 
+import numpy as np
 import torch
 
 from legged_gym.reset_utils import resolve_dof_pos_reset_range
 from legged_gym.scripts.replay_geometry import (
+    deterministic_ground_noise,
     single_box_rear_x,
     single_box_world_bounds,
 )
 
 
 class SingleBoxWorldBoundsTests(unittest.TestCase):
+    def test_ground_noise_is_deterministic_and_bounded(self):
+        first = deterministic_ground_noise(
+            (7, 9), 0.005, 0.1, 0.01, 0.2, 17
+        )
+        second = deterministic_ground_noise(
+            (7, 9), 0.005, 0.1, 0.01, 0.2, 17
+        )
+        np.testing.assert_array_equal(first, second)
+        self.assertEqual(first.dtype, np.int16)
+        self.assertLessEqual(int(np.max(np.abs(first))), 2)
+        self.assertTrue(bool(np.any(first != 0)))
+
     def test_bounds_follow_each_selected_terrain_origin(self):
         origins = torch.tensor(
             [

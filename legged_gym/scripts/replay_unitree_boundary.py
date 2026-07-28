@@ -44,12 +44,15 @@ from real_control_safety import (
     STARTUP_RAMP_S,
     PolicyPrimeGate,
     PolicyTransitionGuard,
+    RemoteEdgeTracker,
     constrain_policy_target,
     interpolate_pose,
     prepare_policy_action,
     validate_policy_entry_state,
     validate_policy_prime_inputs,
+    validate_policy_request_input,
     validate_policy_runtime_inputs,
+    validate_takeover_inputs,
 )
 from unitree_boundary import (
     BoundaryLowState,
@@ -69,7 +72,17 @@ LEGACY_JOINT_REINDEX = np.asarray(
     dtype=np.int64,
 )
 LEGACY_FOOT_REINDEX = np.asarray([1, 0, 3, 2], dtype=np.int64)
-PHASE_CODES = {"startup": 0, "prime": 1, "policy": 2, "rejected": 3}
+PHASE_CODES = {
+    "dryrun": 0,
+    "startup": 1,
+    "prime": 2,
+    "stand_hold": 3,
+    "policy": 4,
+    "rejected": 5,
+}
+SIM_REMOTE_L1 = 2
+SIM_REMOTE_Y = 2048
+SIM_REMOTE_L1_STEP = 5
 LANE_COLORS = {
     "direct": gymapi.Vec3(0.15, 0.35, 1.0),
     "boundary": gymapi.Vec3(0.1, 0.85, 0.2),
@@ -337,6 +350,8 @@ def boundary_summary(
     max_steps: int,
     steps_executed: int,
     guard_mode: str,
+    l1_event_step: int,
+    y_event_step: int,
 ) -> Tuple[Dict[str, np.ndarray], bool, str]:
     boundary_index = [state.kind for state in lane_states].index("boundary")
     boundary = lane_states[boundary_index]
@@ -345,6 +360,8 @@ def boundary_summary(
         "no_fault": not boundary.faulted,
         "crossed_box": boundary.crossed_box,
         "target_parity": boundary.max_target_parity_error <= 1e-6,
+        "remote_l1": l1_event_step >= 0,
+        "remote_y": y_event_step >= 0,
     }
     if guard_mode == "full":
         checks.update(
@@ -352,10 +369,6 @@ def boundary_summary(
                 "transition_target_step": (
                     boundary.max_transition_target_step
                     <= POLICY_TRANSITION_MAX_STEP_RAD + 1e-6
-                ),
-                "steady_target_step": (
-                    boundary.max_steady_target_step
-                    <= POLICY_TARGET_MAX_STEP_RAD + 1e-6
                 ),
                 "joint_limits": boundary.joint_limit_violation <= 1e-8,
                 "torque_limits": boundary.max_torque_ratio <= 1.000001,
@@ -370,6 +383,8 @@ def boundary_summary(
         "summary_status": np.asarray(status, dtype="<U16"),
         "summary_complete_run": np.asarray(complete_run, dtype=np.bool_),
         "summary_steps_executed": np.asarray(steps_executed, dtype=np.int64),
+        "summary_l1_event_step": np.asarray(l1_event_step, dtype=np.int64),
+        "summary_y_event_step": np.asarray(y_event_step, dtype=np.int64),
         "summary_passed": np.asarray(passed, dtype=np.bool_),
         "summary_guard_mode": np.asarray(guard_mode, dtype="<U16"),
         "summary_boundary_checks": np.asarray(
@@ -450,6 +465,17 @@ def replay(args) -> None:
         raise ValueError(
             "EXTREME_BOUNDARY_GUARDS must be either 'full' or 'mapping'"
         )
+    ground_noise_m = float(
+        os.environ.get("EXTREME_GROUND_NOISE_M", "0.0")
+    )
+    ground_noise_seed = int(
+        os.environ.get("EXTREME_GROUND_NOISE_SEED", "17")
+    )
+    ground_noise_patch_m = float(
+        os.environ.get("EXTREME_GROUND_NOISE_PATCH_M", "0.2")
+    )
+    if ground_noise_m < 0.0:
+        raise ValueError("EXTREME_GROUND_NOISE_M must be non-negative")
     log_dir = Path(
         os.environ.get(
             "EXTREME_BOUNDARY_LOG_DIR",
@@ -470,7 +496,11 @@ def replay(args) -> None:
         num_envs=num_lanes,
         num_terrain_columns=num_lanes,
     )
-    install_single_box_terrain()
+    install_single_box_terrain(
+        ground_noise_m,
+        ground_noise_seed,
+        ground_noise_patch_m,
+    )
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     align_lanes_to_first_terrain_row(env)
     color_and_frame_lanes(env, lane_kinds)
@@ -530,7 +560,11 @@ def replay(args) -> None:
     previous_depth = None
     latest_depth_time = None
     context_cycle = 0
-    phase = "startup"
+    phase = "dryrun"
+    startup_start_time = None
+    remote = RemoteEdgeTracker()
+    l1_event_step = -1
+    y_event_step = -1
     recorder = ReplayRecorder(lane_kinds)
     box_rear = single_box_rear_x(env.env_origins).detach().cpu().numpy()
 
@@ -540,7 +574,11 @@ def replay(args) -> None:
     ))
     if lane_kinds == ("direct", "boundary", "legacy"):
         print("Viewer colors: blue=direct, green=fixed boundary, red=legacy fault")
-    print("Automatic sequence: 3.0 s stand -> 0.5 s prime -> policy")
+    print("Simulated remote sequence: L1 -> 3.0 s stand -> 0.5 s prime -> Y")
+    print(
+        f"Ground noise: +/-{ground_noise_m:.4f} m, "
+        f"patch={ground_noise_patch_m:.3f} m, seed={ground_noise_seed}"
+    )
     print(f"Boundary guard mode: {guard_mode}")
     print(f"NPZ log directory: {log_dir}")
     if not args.headless:
@@ -554,25 +592,100 @@ def replay(args) -> None:
             env.commands.zero_()
             env.commands[:, 0] = FORWARD_COMMAND_MPS
 
-            if phase == "startup" and sim_time >= STARTUP_RAMP_S:
-                phase = "prime"
-                history.zero_()
-                episode_length.zero_()
-                depth_encoder.hidden_states = None
-                visual_output = None
-                previous_depth = None
-                latest_depth_time = None
-                context_cycle = 0
-                for lane in lane_states:
-                    lane.last_action.fill(0.0)
-                    lane.last_contacts.fill(False)
-                    lane.prime_gate = PolicyPrimeGate(sim_time)
-
             low_states, isaac_foot_force = synthesize_low_states(env)
             decoded = [decode_low_state(state) for state in low_states]
             for index, lane in enumerate(lane_states):
                 if lane.kind == "legacy":
                     decoded[index] = legacy_decoded_state(decoded[index])
+
+            simulated_keys = 0
+            if step == SIM_REMOTE_L1_STEP:
+                simulated_keys = SIM_REMOTE_L1
+            elif phase == "stand_hold" and y_event_step < 0:
+                simulated_keys = SIM_REMOTE_Y
+            remote.update(simulated_keys, sim_time)
+            l1_rising = remote.consume_rising(SIM_REMOTE_L1)
+            y_rising = remote.consume_rising(SIM_REMOTE_Y)
+
+            if phase == "dryrun" and l1_rising:
+                boundary_index = [
+                    state.kind for state in lane_states
+                ].index("boundary")
+                validate_takeover_inputs(
+                    decoded[boundary_index].joint_q,
+                    decoded[boundary_index].joint_dq,
+                    0.0,
+                    0.0,
+                )
+                l1_event_step = step
+                startup_start_time = sim_time
+                phase = "startup"
+                for index, lane in enumerate(lane_states):
+                    lane.start_q = decoded[index].joint_q.copy()
+                    lane.previous_target_q = lane.start_q.copy()
+                    lane.previous_physical_q = np.asarray(
+                        real_to_sim(
+                            encode_lane_target(
+                                lane.kind,
+                                lane.start_q,
+                                contract,
+                            ).motor_q
+                        ),
+                        dtype=np.float64,
+                    )
+                print(f"step={step} simulated L1 takeover accepted")
+
+            if phase == "startup":
+                if startup_start_time is None:
+                    raise RuntimeError("startup time is unavailable")
+                if sim_time - startup_start_time >= STARTUP_RAMP_S:
+                    phase = "prime"
+                    history.zero_()
+                    episode_length.zero_()
+                    depth_encoder.hidden_states = None
+                    visual_output = None
+                    previous_depth = None
+                    latest_depth_time = None
+                    context_cycle = 0
+                    for lane in lane_states:
+                        lane.last_action.fill(0.0)
+                        lane.last_contacts.fill(False)
+                        lane.prime_gate = PolicyPrimeGate(sim_time)
+                    print(f"step={step} startup complete; policy prime started")
+
+            if phase == "stand_hold" and y_rising:
+                if remote.latest_time is None:
+                    raise RuntimeError("simulated remote time is unavailable")
+                validate_policy_request_input(sim_time - remote.latest_time)
+                for index, lane in enumerate(lane_states):
+                    if lane.kind != "direct":
+                        try:
+                            validate_policy_entry_state(
+                                decoded[index].foot_force,
+                                decoded[index].roll_pitch[0],
+                                decoded[index].roll_pitch[1],
+                                decoded[index].joint_q,
+                                lane.previous_target_q,
+                                np.zeros(12),
+                                np.zeros(12),
+                                np.zeros(12),
+                            )
+                        except RuntimeError as error:
+                            if lane.kind == "boundary":
+                                raise
+                            lane.policy_enabled = False
+                            lane.entry_rejection = str(error)
+                            print(
+                                f"step={step} lane={lane.kind} policy "
+                                f"entry rejected: {error}"
+                            )
+                    lane.transition.begin(
+                        lane.previous_target_q,
+                        sim_time,
+                    )
+                y_event_step = step
+                phase = "policy"
+                print(f"step={step} simulated Y policy request accepted")
 
             proprio = None
             depth_updated = False
@@ -635,35 +748,9 @@ def replay(args) -> None:
                             lane.prime_gate.record_depth()
                         ready.append(lane.prime_gate.ready(sim_time))
                     if all(ready):
-                        for index, lane in enumerate(lane_states):
-                            if lane.kind != "direct":
-                                try:
-                                    validate_policy_entry_state(
-                                        decoded[index].foot_force,
-                                        decoded[index].roll_pitch[0],
-                                        decoded[index].roll_pitch[1],
-                                        decoded[index].joint_q,
-                                        lane.previous_target_q,
-                                        np.zeros(12),
-                                        np.zeros(12),
-                                        np.zeros(12),
-                                    )
-                                except RuntimeError as error:
-                                    if lane.kind == "boundary":
-                                        raise
-                                    lane.policy_enabled = False
-                                    lane.entry_rejection = str(error)
-                                    print(
-                                        f"step={step} lane={lane.kind} policy "
-                                        f"entry rejected: {error}"
-                                    )
-                            lane.transition.begin(
-                                lane.previous_target_q,
-                                sim_time,
-                            )
-                        phase = "policy"
+                        phase = "stand_hold"
                         print(
-                            f"step={step} prime complete; automatic policy engagement"
+                            f"step={step} prime complete; waiting for simulated Y"
                         )
                 context_cycle += 1
 
@@ -702,16 +789,21 @@ def replay(args) -> None:
             transition_active = np.zeros(num_lanes, dtype=np.bool_)
 
             for index, lane in enumerate(lane_states):
-                if phase == "startup":
+                if phase == "dryrun":
+                    requested = lane.start_q.copy()
+                    commanded = lane.start_q.copy()
+                elif phase == "startup":
+                    if startup_start_time is None:
+                        raise RuntimeError("startup time is unavailable")
                     logical_target = interpolate_pose(
                         lane.start_q,
                         contract.default_q,
-                        sim_time,
+                        sim_time - startup_start_time,
                         STARTUP_RAMP_S,
                     )
                     requested = logical_target.copy()
                     commanded = logical_target.copy()
-                elif phase == "prime" or not lane.policy_enabled:
+                elif phase in ("prime", "stand_hold") or not lane.policy_enabled:
                     requested = contract.default_q.copy()
                     commanded = contract.default_q.copy()
                 elif lane.kind == "direct":
@@ -1002,6 +1094,22 @@ def replay(args) -> None:
                     [lane.completed for lane in lane_states],
                     dtype=np.bool_,
                 ),
+                simulated_remote_keys=np.asarray(
+                    remote.keys,
+                    dtype=np.int64,
+                ),
+                simulated_l1_rising=np.asarray(
+                    l1_rising,
+                    dtype=np.bool_,
+                ),
+                simulated_y_rising=np.asarray(
+                    y_rising,
+                    dtype=np.bool_,
+                ),
+                lowcmd_authorized=np.asarray(
+                    phase != "dryrun",
+                    dtype=np.bool_,
+                ),
             )
 
             step += 1
@@ -1034,6 +1142,20 @@ def replay(args) -> None:
             max_steps,
             step,
             guard_mode,
+            l1_event_step,
+            y_event_step,
+        )
+        summary["summary_ground_noise_m"] = np.asarray(
+            ground_noise_m,
+            dtype=np.float64,
+        )
+        summary["summary_ground_noise_seed"] = np.asarray(
+            ground_noise_seed,
+            dtype=np.int64,
+        )
+        summary["summary_ground_noise_patch_m"] = np.asarray(
+            ground_noise_patch_m,
+            dtype=np.float64,
         )
         if recorder.values:
             log_path = recorder.save(log_dir, summary)

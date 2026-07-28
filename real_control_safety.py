@@ -237,6 +237,22 @@ def filter_foot_contacts(
     return np.logical_or(current, previous), current
 
 
+def update_motor_lost_baseline(
+    motor_lost: Sequence[float],
+    motor_lost_baseline: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Advance cumulative lost counters and report indices that increased."""
+    current = _finite_vector(motor_lost, 12, "motor lost status")
+    baseline = _finite_vector(
+        motor_lost_baseline,
+        12,
+        "motor lost baseline",
+    )
+    if bool(np.any(current < 0.0) or np.any(baseline < 0.0)):
+        raise RealControlError("motor lost counters must be non-negative")
+    return current.copy(), np.flatnonzero(current > baseline)
+
+
 def validate_policy_entry_state(
     foot_force: Sequence[float],
     roll_rad: float,
@@ -267,14 +283,15 @@ def validate_policy_entry_state(
 
     _finite_vector(motor_temperature, 12, "motor temperature")
 
-    lost = _finite_vector(motor_lost, 12, "motor lost status")
-    baseline = _finite_vector(
+    _, increased = update_motor_lost_baseline(
+        motor_lost,
         motor_lost_baseline,
-        12,
-        "motor lost baseline",
     )
-    if bool(np.any(lost > baseline)):
-        raise RealControlError("one or more motor lost counters increased")
+    if increased.size:
+        raise RealControlError(
+            "one or more motor lost counters increased at indices "
+            f"{increased.tolist()}"
+        )
 
 
 def quintic_smoothstep(progress: float) -> float:
@@ -351,6 +368,34 @@ class PolicyPrimeGate:
             and self.proprio_samples >= self.required_proprio_samples
             and self.depth_samples >= self.required_depth_samples
         )
+
+
+class RemoteEdgeTracker:
+    """Track fresh remote samples and one-shot button rising edges."""
+
+    def __init__(self) -> None:
+        self.keys = 0
+        self.rising_edges = 0
+        self.latest_time = None
+
+    def update(self, keys: int, now: float) -> None:
+        value = int(keys)
+        timestamp = float(now)
+        if value < 0:
+            raise RealControlError("remote keys must be non-negative")
+        if not math.isfinite(timestamp):
+            raise RealControlError("remote sample time must be finite")
+        self.rising_edges |= value & ~self.keys
+        self.keys = value
+        self.latest_time = timestamp
+
+    def consume_rising(self, button: int) -> bool:
+        mask = int(button)
+        if mask <= 0:
+            raise RealControlError("remote button mask must be positive")
+        pressed = bool(self.rising_edges & mask)
+        self.rising_edges &= ~mask
+        return pressed
 
 
 class PolicyTransitionGuard:

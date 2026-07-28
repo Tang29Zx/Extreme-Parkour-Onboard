@@ -12,12 +12,14 @@ from real_control_safety import (
     PolicyTargetInfeasibleError,
     PolicyPrimeGate,
     PolicyTransitionGuard,
+    RemoteEdgeTracker,
     RealControlError,
     classify_foot_contacts,
     constrain_policy_target,
     executed_target_to_action,
     filter_foot_contacts,
     interpolate_pose,
+    update_motor_lost_baseline,
     prepare_policy_action,
     release_mode_required,
     validate_policy_prime_inputs,
@@ -30,6 +32,32 @@ from real_control_safety import (
 
 
 class RealControlSafetyTest(unittest.TestCase):
+    def test_motor_lost_baseline_consumes_waiting_period_increment(self):
+        baseline = np.full(12, 5.0)
+        current = baseline.copy()
+        current[5] = 6.0
+
+        baseline, increased = update_motor_lost_baseline(current, baseline)
+        np.testing.assert_array_equal(increased, [5])
+
+        baseline, increased = update_motor_lost_baseline(current, baseline)
+        self.assertEqual(increased.size, 0)
+
+    def test_remote_edges_are_fresh_and_consumed_once(self):
+        tracker = RemoteEdgeTracker()
+        tracker.update(0, 1.0)
+        tracker.update(2, 1.1)
+        self.assertEqual(tracker.latest_time, 1.1)
+        self.assertTrue(tracker.consume_rising(2))
+        self.assertFalse(tracker.consume_rising(2))
+
+        tracker.update(2, 1.2)
+        self.assertFalse(tracker.consume_rising(2))
+        tracker.update(0, 1.3)
+        tracker.update(2 | 2048, 1.4)
+        self.assertTrue(tracker.consume_rising(2))
+        self.assertTrue(tracker.consume_rising(2048))
+
     def test_real_publish_requires_motion_switcher_authorization(self):
         with self.assertRaises(RealControlError):
             validate_real_low_command_publish(False, False)

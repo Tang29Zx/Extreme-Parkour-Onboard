@@ -9,6 +9,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 from torch import nn
+from std_msgs.msg import String
 
 from flight_recorder import FlightRecorder
 from joint_mapping import FOOT_REAL_TO_SIM
@@ -17,6 +18,12 @@ from real_control_safety import (
     PolicyTargetInfeasibleError,
     RealControlError,
     classify_foot_contacts,
+)
+from runtime_status import (
+    RUNTIME_STATUS_PERIOD_S,
+    RUNTIME_STATUS_TOPIC,
+    build_runtime_status,
+    should_publish_runtime_status,
 )
 from rsl_rl.modules import RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
 
@@ -30,6 +37,13 @@ class Go2Node(UnitreeRos2Real):
         self.flight_recorder = FlightRecorder(flight_log_dir)
         self.flight_record_error_reported = False
         self.pending_flight_reason = None
+        self.runtime_status_pub = self.create_publisher(
+            String,
+            RUNTIME_STATUS_TOPIC,
+            1,
+        )
+        self.runtime_status_last_publish_time = None
+        self.runtime_status_error_reported = False
 
         self.use_stand_policy = False
         self.use_parkour_policy = False
@@ -112,6 +126,7 @@ class Go2Node(UnitreeRos2Real):
 
     def _record_control(self, command, loop_started):
         now = time.monotonic()
+        loop_s = now - loop_started
         motor_states = [
             self.low_state_buffer.motor_state[self.dof_map[index]]
             for index in range(self.NUM_DOF)
@@ -145,6 +160,7 @@ class Go2Node(UnitreeRos2Real):
             motor_states[index].tau_est * self.dof_signs[index]
             for index in range(self.NUM_DOF)
         ]
+        contact_state = classify_foot_contacts(foot_force)
         try:
             self.flight_recorder.record_control(
                 timestamp=now,
@@ -158,17 +174,92 @@ class Go2Node(UnitreeRos2Real):
                 measured_dq=velocity,
                 imu_quaternion=self.low_state_buffer.imu_state.quaternion,
                 foot_force=foot_force,
-                contact_state=classify_foot_contacts(foot_force),
+                contact_state=contact_state,
                 motor_temperature=motor_temperature,
                 motor_lost=motor_lost,
                 motor_tau_est=motor_tau_est,
                 input_ages=input_ages,
-                loop_s=now - loop_started,
+                loop_s=loop_s,
             )
         except (TypeError, ValueError) as error:
             if not self.flight_record_error_reported:
                 self.get_logger().error(f"Flight recorder rejected a sample: {error}")
                 self.flight_record_error_reported = True
+        self._publish_runtime_status(
+            now=now,
+            command=command,
+            position=position,
+            velocity=velocity,
+            input_ages=input_ages,
+            foot_force=foot_force,
+            contact_state=contact_state,
+            motor_temperature=motor_temperature,
+            motor_lost=motor_lost,
+            motor_tau_est=motor_tau_est,
+            loop_s=loop_s,
+        )
+
+    def _publish_runtime_status(
+        self,
+        *,
+        now,
+        command,
+        position,
+        velocity,
+        input_ages,
+        foot_force,
+        contact_state,
+        motor_temperature,
+        motor_lost,
+        motor_tau_est,
+        loop_s,
+    ):
+        """Publish best-effort diagnostics without changing control output."""
+        try:
+            if not should_publish_runtime_status(
+                self.runtime_status_last_publish_time,
+                now,
+                RUNTIME_STATUS_PERIOD_S,
+            ):
+                return
+            self.runtime_status_last_publish_time = now
+            loop_samples = tuple(
+                record["loop_s"]
+                for record in self.flight_recorder.control_records
+            )
+            message = String()
+            message.data = build_runtime_status(
+                timestamp_unix_s=time.time(),
+                phase=command["phase"],
+                dryrun=self.dryrun,
+                real_lowcmd_authorized=self.real_lowcmd_authorized,
+                engagement_active=command["engagement_active"],
+                input_ages_s=input_ages,
+                roll_pitch_rad=self._current_roll_pitch(),
+                foot_force=foot_force,
+                contact_state=contact_state,
+                measured_q=position,
+                commanded_q=command["commanded_q"],
+                measured_dq=velocity,
+                raw_action=command["raw_action"],
+                requested_q=command["requested_q"],
+                motor_temperature=motor_temperature,
+                motor_lost=motor_lost,
+                motor_tau_est=motor_tau_est,
+                torque_limits=self.torque_limits_np,
+                kp=self.p_gains_np,
+                kd=self.d_gains_np,
+                loop_samples_s=loop_samples or (loop_s,),
+            )
+            self.runtime_status_pub.publish(message)
+            self.runtime_status_error_reported = False
+        except Exception as error:
+            self.runtime_status_last_publish_time = now
+            if not self.runtime_status_error_reported:
+                self.get_logger().error(
+                    f"Runtime status publication failed: {error}"
+                )
+                self.runtime_status_error_reported = True
 
     def flush_flight_record(self, reason):
         try:
@@ -265,6 +356,9 @@ class Go2Node(UnitreeRos2Real):
             self.use_stand_policy = True
             self.use_parkour_policy = False
             self.use_sport_mode = False
+
+        if self.real_control_phase == "stand_hold":
+            self.monitor_stand_hold_motor_lost()
 
         if y_pressed:
             if self.begin_policy_transition():

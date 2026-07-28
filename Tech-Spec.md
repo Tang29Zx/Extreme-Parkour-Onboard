@@ -109,6 +109,31 @@ raw_action (12 finite values)
 tensor。L2、R2、异常和退出时将原始/实际动作、请求/下发/实测关节状态、IMU、足端力、
 输入年龄、视觉统计和循环耗时写入`--flight-log-dir`下的时间戳NPZ。
 
+实时观测使用`std_msgs/msg/String`话题`/extreme_parkour/runtime_status`，QoS深度为1，
+schema version为1。控制记录完成后用单调时钟限制为每0.5秒最多发布一次；JSON包含：
+
+```text
+phase, dryrun, real_lowcmd_authorized, engagement_active
+input_age_ms(low_state, remote, depth)
+body(roll_deg, pitch_deg)
+feet(force, contact)
+joint(measured_q, commanded_q, measured_dq, max_tracking_error)
+policy(max_abs_raw_action, max_request_command_delta)
+motor(temperature, lost, tau_est, max_abs_tau_ratio, max_abs_pd_tau_ratio)
+loop_ms(last, p50, p95, max, samples)
+```
+
+状态构建器是无ROS纯函数，所有数值必须有限，累计`lost`必须为非负整数，力矩限值必须
+为正。发布端复用本周期已经取得的LowState、命令和内存环形缓冲，不读取原始深度、不
+写磁盘；序列化或publisher异常由观测边界捕获并限频报告，不得传播到控制状态机。
+`scripts/read_runtime_status.py`只创建订阅端，默认输出单行摘要，并以transient-local
+QoS读取`/rosout`中`unitree_ros2_real`的实时及缓存事件；`--json`输出完整状态JSON，
+`--logger-name`可覆盖日志过滤名。
+
+2026-07-28使用ROS 2 Jazzy隔离domain 232联调：合成controller的schema v1状态和
+`/rosout` warning均被读取端实时显示。57个Python 3.8测试、相关语法检查和diff检查
+通过；Foxy Jetson及真实控制节点话题仍待部署后验证。
+
 2026-07-27静态验证：43个深度、映射、输出隔离、上下文、接入保护、飞行记录和
 回放几何测试通过；相关文件通过Python 3.8语法检查和`git diff --check`。新policy
 prime、Y接入保护、飞行记录和控制循环p95尚未在Jetson dry-run或真机上验收。
@@ -159,12 +184,15 @@ previous = current
 Y入口按同一时刻的LowState检查：四足当前接触、`|roll|/|pitch| <= 8°`、
 `max(|measured_q-commanded_q|) <= 0.2 rad`。prime开始时锁存12个电机`lost`计数，
 恒定的历史非零值允许通过；任一计数增长会更新基线并重新开始完整0.5秒prime。
-温度字段只要求可记录，不使用经验温度阈值阻断Y。stand_hold中按Y时再次检查；
-失败会回到policy prime，不进入策略。
+prime完成后，`stand_hold`在每个50 Hz控制周期继续比较最新计数与上一周期基线；增长
+必须在没有Y事件时就自动回到prime。这样一次增长只有在随后连续0.5秒稳定后才重新
+进入`stand_hold`，不会在数分钟后按Y时被误判为当下故障。Y事件处理前先执行该观察，
+随后仍按同一LowState重复入口检查，因此Y当帧的新增长继续被拒绝。温度字段只要求
+可记录，不使用经验温度阈值阻断Y；其他入口检查失败仍回到policy prime，不进入策略。
 
 `PolicyTransitionGuard`将前1秒目标限制在接入起点`±0.3 rad`和0.05 rad/周期，
-并用后级实际下发目标作为下一周期基准。完整1秒后固定退出接入态，独立的持续输出保护
-以0.10 rad/周期执行目标步长、机械限位和PD力矩约束。运行期速度检查使用URDF标称
+并用后级实际下发目标作为下一周期基准。完整1秒后固定退出接入态，取消额外目标步长
+限制以恢复训练时的动态响应，持续输出保护只执行机械限位和PD力矩约束。运行期速度检查使用URDF标称
 上限的0.5%相对测量容差，避免浮点边界和传感器量化导致误停。按用户确认，接入后不使用
 roll/pitch、足端接触或温度自动motor-off；
 LowState反馈超时仍是硬停止条件。R2保留为人工motor-off急停，L2始终执行原有的
@@ -204,9 +232,15 @@ LowCmd回到PhysX时必须同时计算显式Isaac目标和`env.step()`需要的a
 接触使用PhysX足端合力的模作为合成Unitree标量，再执行生产阈值5和一帧逻辑或；
 这只验证顺序和滤波逻辑，不代表真机力标定。
 
-回放状态机按50 Hz仿真时间运行：150周期实测位姿到默认姿态的五次渐变，随后25周期
-默认站姿prime并重建本体历史和5次视觉GRU状态，然后自动开始1秒策略接入。LowState
-每周期更新，深度每5周期更新，生产0.25秒新鲜度门槛仍执行。
+回放状态机按50 Hz仿真时间运行：共享`RemoteEdgeTracker`生成并消费L1上升沿，随后
+150周期实测位姿到默认姿态的五次渐变，再用25周期默认站姿prime重建本体历史和5次
+视觉GRU状态；只有新的Y上升沿通过入口检查后才开始1秒策略接入。LowState每周期更新，
+深度每5周期更新，生产0.25秒新鲜度门槛仍执行。L1前虽然PhysX需要内部保持目标，
+日志中的LowCmd授权必须保持false。
+
+单箱物理高度场可叠加固定种子的块状均匀噪声，参数为幅度、块尺寸和种子。噪声先写入
+地面，箱体顶面随后恢复为精确20 cm；默认幅度为0，实机前鲁棒性验收使用±5 mm、
+0.2 m噪声块和种子17。
 
 Viewer中A/B/C分别使用蓝/绿/红车身；C只在回放脚本内部注入旧
 `[3,4,5,0,1,2,9,10,11,6,7,8]`关节重排和`[1,0,3,2]`足端重排。绿色B是唯一
@@ -229,6 +263,9 @@ Viewer中A/B/C分别使用蓝/绿/红车身；C只在回放脚本内部注入旧
 绿色边界越过`x=3.40 m`后正常结束。`fixed/full`的接入/稳态最大目标变化分别为
 0.05/0.10 rad，最大估算力矩比例0.8535，无reset、保护故障、机械限位越界或
 LowCmd到PhysX目标差异。红色旧映射在入口检查被拒绝，故保持站姿。
+
+同日模拟遥控与粗糙地面验收：L1第5步、Y第183步，绿色边界在±5 mm物理地面噪声
+上第422步越过`x=3.40 m`，最大力矩比例0.8812，无reset、fault或目标越界。
 
 同机非headless短跑在创建场景前由Isaac Gym进程以退出码139结束；`DISPLAY=:0`可访问，
 RTX 5070 Ti和580.159.03驱动可被`nvidia-smi`识别，CPU headless正常。当前证据只能确认

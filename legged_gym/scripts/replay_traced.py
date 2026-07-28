@@ -51,6 +51,7 @@ from legged_gym.scripts.replay_geometry import (
     BOX_LENGTH_M,
     BOX_WIDTH_M,
     TRACK_CENTER_Y_M,
+    deterministic_ground_noise,
     single_box_world_bounds,
 )
 from legged_gym.utils import get_args, task_registry
@@ -62,8 +63,12 @@ FORWARD_COMMAND_MPS = 0.5
 VISUAL_UPDATE_INTERVAL = 5
 
 
-def install_single_box_terrain() -> None:
-    """Limit this replay process to one exact 0.2 m box."""
+def install_single_box_terrain(
+    ground_noise_m: float = 0.0,
+    ground_noise_seed: int = 1,
+    ground_noise_patch_m: float = 0.2,
+) -> None:
+    """Limit this replay process to one box on reproducibly uneven ground."""
 
     def make_single_box(self, choice, difficulty):
         del choice, difficulty
@@ -73,6 +78,14 @@ def install_single_box_terrain() -> None:
             length=self.width_per_env_pixels,
             vertical_scale=self.cfg.vertical_scale,
             horizontal_scale=self.cfg.horizontal_scale,
+        )
+        terrain.height_field_raw[:] = deterministic_ground_noise(
+            terrain.height_field_raw.shape,
+            terrain.vertical_scale,
+            terrain.horizontal_scale,
+            ground_noise_m,
+            ground_noise_patch_m,
+            ground_noise_seed,
         )
         x0 = round(BOX_FRONT_M / terrain.horizontal_scale)
         x1 = round((BOX_FRONT_M + BOX_LENGTH_M) / terrain.horizontal_scale)
