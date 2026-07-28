@@ -72,7 +72,7 @@ Sport Mode + model warm-up
 -> stand_hold
 -> Y rising edge
 -> policy_engagement: 1 s quintic blend, <=0.05 rad/cycle
--> policy: <=0.10 rad/cycle, continuous input watchdog and output constraints
+-> policy: hip/thigh <=0.20, calf <=0.40 rad/cycle, continuous constraints
 ```
 
 MotionSwitcher RPC每次2秒超时，最多3次。publisher对象可以在ReleaseMode前创建，
@@ -100,7 +100,8 @@ raw_action (12 finite values)
 
 `self.actions`保存actor原始输出，因为训练环境在延迟和裁剪之前写入动作历史。输出
 保护后的执行动作只进入飞行记录。每个policy周期先验证LowState和深度年龄不超过
-0.25秒，再将请求目标与上一命令`±0.10 rad`、机械关节范围及由最新`q/dq/Kp/Kd`
+0.25秒，再将请求目标与上一命令的hip/thigh `±0.20 rad`、calf `±0.40 rad`范围、
+机械关节范围及由最新`q/dq/Kp/Kd`
 推导出的PD力矩可行区间求交。深度超时进入站姿恢复；可行交集为空时恢复轨迹也
 无法同时满足约束，因此与LowState超时一样发送motor-off尾帧并锁定在
 `emergency_stop`。
@@ -266,6 +267,21 @@ LowCmd到PhysX目标差异。红色旧映射在入口检查被拒绝，故保持
 
 同日模拟遥控与粗糙地面验收：L1第5步、Y第183步，绿色边界在±5 mm物理地面噪声
 上第422步越过`x=3.40 m`，最大力矩比例0.8812，无reset、fault或目标越界。
+
+切换到`model_38300`并将当前稳态目标步长改为0.12 rad后，相同`fixed/full`、
+±5 mm、0.2 m噪声块和种子17回放在第412步越过`x=3.40 m`；最大稳态目标变化
+0.12 rad，0 reset、0 fault，机械和PD力矩边界检查通过。该结果不覆盖0.45 m箱体、
+固件PD、DDS或真机动力学。
+
+继续将本地稳态目标步长改为0.15 rad后，相同回放在第407步越过`x=3.40 m`，
+0 reset、0 fault；输出保护修改周期由195降至170，最大预测力矩比例由0.8841升至
+0.9421，roll范围为-10.93°～+1.97°，pitch范围为-22.26°～+5.78°。该单次20 cm
+确定性回放只证明当前边界链可闭环完成，不构成0.45 m箱体或真机安全结论。
+
+保持hip/thigh 0.20 rad并只将calf改为0.40 rad后，相同回放在第394步越过
+`x=3.40 m`，0 reset、0 fault。四个calf稳态最大步进均为0.40 rad，四个thigh均为
+0.20 rad，hip最大0.1599 rad；最大预测力矩比例1.00，机械和PD力矩边界检查通过。
+S2S摘要保存逐关节稳态最大步进并将其纳入PASS条件。
 
 同机非headless短跑在创建场景前由Isaac Gym进程以退出码139结束；`DISPLAY=:0`可访问，
 RTX 5070 Ti和580.159.03驱动可被`nvidia-smi`识别，CPU headless正常。当前证据只能确认

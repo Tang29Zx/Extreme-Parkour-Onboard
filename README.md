@@ -77,8 +77,9 @@ CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命�
 - prime完成后等待Y期间仍以50 Hz观察累计`lost`计数；发现增长会立即自动重新prime，
   连续稳定0.5秒后重新接受Y，不会把几分钟前已经稳定的增长延迟到按Y时才拒绝。
 - 短按并释放 **Y** 进入策略；前1秒以五次曲线接入且每周期最多变化0.05 rad，
-  第1秒相对起点还限制在0.3 rad以内。接入完成后以0.10 rad/周期持续限制目标变化、机械
-  关节范围和估算PD力矩；策略观测中的`last_actions`保持上一帧actor原始输出。
+  第1秒相对起点还限制在0.3 rad以内。接入完成后hip/thigh以0.20 rad/周期、calf
+  以0.40 rad/周期持续限制目标变化、机械关节范围和估算PD力矩；策略观测中的
+  `last_actions`保持上一帧actor原始输出。
   接入后不根据姿态自动motor-off。
 - policy运行中每周期检查LowState、深度、关节位置和速度。深度过期或状态越界时
   进入站姿恢复；LowState超过0.25秒没有更新，或不存在同时满足步长、关节和力矩
@@ -162,7 +163,8 @@ EXTREME_GROUND_NOISE_SEED=17 \
 加入`--headless`执行无窗口验收；使用`EXTREME_BOUNDARY_COMPARISON=fixed`只运行绿色
 边界。`EXTREME_BOUNDARY_GUARDS=mapping`保留1秒接入渐变但关闭稳态输出约束，只用于
 隔离顺序、观测和LowCmd往返问题，不能代表真机安全链。默认`full`会执行生产端每周期
-输入检查、接入期0.05 rad/周期、稳态0.10 rad/周期、机械限位和估算PD力矩约束。
+输入检查、接入期0.05 rad/周期、稳态hip/thigh 0.20 rad/周期、calf 0.40 rad/周期、
+机械限位和估算PD力矩约束。
 关节速度检查对URDF标称上限保留0.5%测量容差，超出该容差仍会停止策略。
 回放使用与生产端相同的遥控器上升沿逻辑，自动注入一次L1和一次Y；L1前不授权
 LowCmd，Y只能在3秒站姿和0.5秒prime完成后生效。`EXTREME_GROUND_NOISE_M`控制
@@ -182,6 +184,21 @@ LowCmd，Y只能在3秒站姿和0.5秒prime完成后生效。`EXTREME_GROUND_NOI
 2026-07-28进一步使用±5 mm、0.2 m噪声块和种子17运行模拟遥控完整链：L1在第5步
 接管，第183步Y通过，绿色边界第422步到达`x=3.4076 m`。结果为PASS，0 reset、
 0 fault，接入/稳态最大目标变化0.05/0.10 rad，最大估算力矩比例0.8812。
+
+同日切换到`model_38300`并按用户要求将稳态上限调整为0.12 rad后，`fixed/full`
+在相同±5 mm、噪声块和种子下于第412步越过单箱，0 reset、0 fault；最大稳态目标
+变化为0.12 rad，机械限位、PD力矩边界和接入期0.05 rad限制均保持有效。该结果只
+验证本地CPU PhysX边界链，不代表Jetson或真机验收。
+
+继续将本地稳态上限调整为0.15 rad后，相同回放于第407步越过单箱，0 reset、
+0 fault；输出保护修改周期由195降至170，但最大预测力矩比例由88.4%升至94.2%，
+pitch下界由-20.3°变为-22.3°。这只是20 cm单箱的一次确定性对照，不能证明0.15 rad
+适用于0.45 m箱体或真机。
+
+按用户要求保持hip/thigh 0.20 rad并只将calf提高到0.40 rad后，相同回放于第394步
+越过单箱，0 reset、0 fault；四个calf稳态最大步进均为0.40 rad，四个thigh均为
+0.20 rad，hip最高0.160 rad。最大预测力矩比例达到1.00，仍由PD力矩交集限制；该
+结果不代表0.45 m箱体或真机安全性。
 
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
 

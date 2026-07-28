@@ -1,7 +1,7 @@
 """Replay exported parkour models through the Unitree low-level boundary."""
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import os
@@ -39,7 +39,7 @@ from legged_gym.scripts.replay_traced import (
 from legged_gym.utils import get_args, task_registry
 from policy_context import update_proprio_history
 from real_control_safety import (
-    POLICY_TARGET_MAX_STEP_RAD,
+    POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
     POLICY_TRANSITION_MAX_STEP_RAD,
     STARTUP_RAMP_S,
     PolicyPrimeGate,
@@ -124,6 +124,9 @@ class LaneState:
     max_target_step: float = 0.0
     max_transition_target_step: float = 0.0
     max_steady_target_step: float = 0.0
+    max_steady_target_step_by_joint: np.ndarray = field(
+        default_factory=lambda: np.zeros(12, dtype=np.float64)
+    )
     max_torque_ratio: float = 0.0
     max_target_parity_error: float = 0.0
     joint_limit_violation: float = 0.0
@@ -370,6 +373,16 @@ def boundary_summary(
                     boundary.max_transition_target_step
                     <= POLICY_TRANSITION_MAX_STEP_RAD + 1e-6
                 ),
+                "steady_target_step": bool(
+                    np.all(
+                        boundary.max_steady_target_step_by_joint
+                        <= np.asarray(
+                            POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+                            dtype=np.float64,
+                        )
+                        + 1e-6
+                    )
+                ),
                 "joint_limits": boundary.joint_limit_violation <= 1e-8,
                 "torque_limits": boundary.max_torque_ratio <= 1.000001,
             }
@@ -447,6 +460,10 @@ def boundary_summary(
             [state.max_steady_target_step for state in lane_states],
             dtype=np.float64,
         ),
+        "summary_max_steady_target_step_by_joint": np.stack(
+            [state.max_steady_target_step_by_joint for state in lane_states],
+            axis=0,
+        ).astype(np.float64),
     }
     detail = ", ".join(f"{name}={value}" for name, value in checks.items())
     return summary, passed, detail
@@ -870,7 +887,7 @@ def replay(args) -> None:
                                     max_step_rad=(
                                         POLICY_TRANSITION_MAX_STEP_RAD
                                         if engagement_active
-                                        else POLICY_TARGET_MAX_STEP_RAD
+                                        else POLICY_TARGET_MAX_STEP_RAD_BY_JOINT
                                     ),
                                 )
                                 if engagement_active:
@@ -937,13 +954,10 @@ def replay(args) -> None:
                     lowcmd.motor_kp * (lowcmd.motor_q - motor_q)
                     - lowcmd.motor_kd * motor_dq
                 )
-                target_step = float(
-                    np.max(
-                        np.abs(
-                            physical_policy_target - lane.previous_physical_q
-                        )
-                    )
+                target_step_by_joint = np.abs(
+                    physical_policy_target - lane.previous_physical_q
                 )
+                target_step = float(np.max(target_step_by_joint))
                 if not lane.faulted:
                     lane.max_target_step = max(lane.max_target_step, target_step)
                     if phase == "policy":
@@ -956,6 +970,10 @@ def replay(args) -> None:
                             lane.max_steady_target_step = max(
                                 lane.max_steady_target_step,
                                 target_step,
+                            )
+                            lane.max_steady_target_step_by_joint = np.maximum(
+                                lane.max_steady_target_step_by_joint,
+                                target_step_by_joint,
                             )
                     lane.max_torque_ratio = max(
                         lane.max_torque_ratio,

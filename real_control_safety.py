@@ -2,7 +2,7 @@
 
 import json
 import math
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Union
 
 import numpy as np
 
@@ -23,7 +23,13 @@ POLICY_PRIME_PROPRIO_SAMPLES = 10
 POLICY_PRIME_DEPTH_SAMPLES = 5
 POLICY_ENGAGEMENT_RAMP_S = 1.0
 POLICY_TRANSITION_MAX_STEP_RAD = 0.05
-POLICY_TARGET_MAX_STEP_RAD = 0.10
+POLICY_TARGET_MAX_STEP_RAD = 0.20
+POLICY_CALF_TARGET_MAX_STEP_RAD = 0.40
+POLICY_TARGET_MAX_STEP_RAD_BY_JOINT = (
+    POLICY_TARGET_MAX_STEP_RAD,
+    POLICY_TARGET_MAX_STEP_RAD,
+    POLICY_CALF_TARGET_MAX_STEP_RAD,
+) * 4
 POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE = 0.005
 POLICY_TARGET_MAX_DEVIATION_RAD = 0.30
 POLICY_STATE_LIMIT_TOLERANCE_RAD = 0.05
@@ -562,7 +568,9 @@ def constrain_policy_target(
     joint_limits_low: Sequence[float],
     joint_limits_high: Sequence[float],
     torque_limits: Sequence[float],
-    max_step_rad: float = POLICY_TARGET_MAX_STEP_RAD,
+    max_step_rad: Union[float, Sequence[float]] = (
+        POLICY_TARGET_MAX_STEP_RAD_BY_JOINT
+    ),
 ) -> np.ndarray:
     """Intersect step, joint, and estimated PD-torque bounds for one target."""
     requested = _joint_vector(requested_q, "requested joint target")
@@ -577,10 +585,18 @@ def constrain_policy_target(
     joint_lower = _joint_vector(joint_limits_low, "joint lower limits")
     joint_upper = _joint_vector(joint_limits_high, "joint upper limits")
     torque = _joint_vector(torque_limits, "joint torque limits")
-    max_step = float(max_step_rad)
+    max_step_value = np.asarray(max_step_rad, dtype=np.float64)
+    if max_step_value.ndim == 0:
+        max_step = np.full(12, float(max_step_value), dtype=np.float64)
+    elif max_step_value.shape == (12,):
+        max_step = max_step_value.copy()
+    else:
+        raise RealControlError(
+            "policy target step must be a scalar or contain 12 values"
+        )
 
-    if not math.isfinite(max_step) or max_step <= 0.0:
-        raise RealControlError("policy target step must be positive")
+    if not np.isfinite(max_step).all() or bool(np.any(max_step <= 0.0)):
+        raise RealControlError("policy target steps must be positive and finite")
     if bool(np.any(p_gain <= 0.0)):
         raise RealControlError("joint proportional gains must be positive")
     if bool(np.any(d_gain < 0.0)):

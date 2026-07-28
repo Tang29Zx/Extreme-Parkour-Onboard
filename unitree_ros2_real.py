@@ -29,7 +29,7 @@ from real_control_safety import (
     RELEASE_MODE_API_ID,
     RPC_MAX_ATTEMPTS,
     RPC_TIMEOUT_S,
-    POLICY_TARGET_MAX_STEP_RAD,
+    POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
     STARTUP_RAMP_S,
     TAKEOVER_HOLD_S,
     DepthStaleError,
@@ -1166,7 +1166,7 @@ class UnitreeRos2Real(Node):
             max_step_rad=(
                 self.policy_transition.max_step_rad
                 if engagement_active
-                else POLICY_TARGET_MAX_STEP_RAD
+                else POLICY_TARGET_MAX_STEP_RAD_BY_JOINT
             ),
         )
         if engagement_active:

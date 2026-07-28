@@ -5,9 +5,11 @@ import numpy as np
 from real_control_safety import (
     DepthStaleError,
     LowStateStaleError,
+    POLICY_CALF_TARGET_MAX_STEP_RAD,
     POLICY_TRANSITION_MAX_STEP_RAD,
     POLICY_TARGET_MAX_DEVIATION_RAD,
     POLICY_TARGET_MAX_STEP_RAD,
+    POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
     POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE,
     PolicyTargetInfeasibleError,
     PolicyPrimeGate,
@@ -467,13 +469,53 @@ class RealControlSafetyTest(unittest.TestCase):
 
         # Torque is the tightest bound here: 100 * 0.01 == 1 Nm.
         np.testing.assert_allclose(target, 0.01)
-        self.assertLessEqual(
-            float(np.max(np.abs(target - previous))),
-            POLICY_TARGET_MAX_STEP_RAD,
+        self.assertTrue(
+            bool(
+                np.all(
+                    np.abs(target - previous)
+                    <= np.asarray(POLICY_TARGET_MAX_STEP_RAD_BY_JOINT)
+                )
+            )
         )
         self.assertTrue(bool(np.all(target <= upper)))
         estimated_torque = kp * (target - measured) - kd * velocity
         self.assertTrue(bool(np.all(np.abs(estimated_torque) <= torque)))
+
+    def test_policy_target_uses_the_steady_step_contract_by_default(self):
+        target = constrain_policy_target(
+            requested_q=np.ones(12),
+            previous_q=np.zeros(12),
+            measured_q=np.zeros(12),
+            measured_dq=np.zeros(12),
+            kp=np.ones(12),
+            kd=np.ones(12),
+            joint_limits_low=np.full(12, -2.0),
+            joint_limits_high=np.full(12, 2.0),
+            torque_limits=np.full(12, 10.0),
+        )
+
+        np.testing.assert_allclose(
+            target,
+            POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+        )
+        self.assertAlmostEqual(POLICY_TARGET_MAX_STEP_RAD, 0.20)
+        self.assertAlmostEqual(POLICY_CALF_TARGET_MAX_STEP_RAD, 0.40)
+
+    def test_policy_target_accepts_a_scalar_transition_step(self):
+        target = constrain_policy_target(
+            requested_q=np.ones(12),
+            previous_q=np.zeros(12),
+            measured_q=np.zeros(12),
+            measured_dq=np.zeros(12),
+            kp=np.ones(12),
+            kd=np.ones(12),
+            joint_limits_low=np.full(12, -2.0),
+            joint_limits_high=np.full(12, 2.0),
+            torque_limits=np.full(12, 10.0),
+            max_step_rad=POLICY_TRANSITION_MAX_STEP_RAD,
+        )
+
+        np.testing.assert_allclose(target, POLICY_TRANSITION_MAX_STEP_RAD)
 
     def test_policy_target_rejects_an_empty_safe_intersection(self):
         with self.assertRaisesRegex(
