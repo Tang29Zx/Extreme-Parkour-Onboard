@@ -100,7 +100,7 @@ raw_action (12 finite values)
 
 `self.actions`保存actor原始输出，因为训练环境在延迟和裁剪之前写入动作历史。输出
 保护后的执行动作只进入飞行记录。每个policy周期先验证LowState和深度年龄不超过
-0.25秒，再将请求目标与上一命令的全关节`±0.20 rad`范围、
+0.25秒，再将请求目标与上一命令的hip/thigh `±0.21 rad`、calf `±0.20 rad`范围、
 机械关节范围及由最新`q/dq/Kp/Kd`
 推导出的PD力矩可行区间求交。深度超时进入站姿恢复；可行交集为空时恢复轨迹也
 无法同时满足约束，因此与LowState超时一样发送motor-off尾帧并锁定在
@@ -211,7 +211,7 @@ LowState反馈超时仍是硬停止条件。R2保留为人工motor-off急停，L
 保存图像来自不同帧。策略循环现有的一帧视觉流水线保持不变：保存的是实际参与本次
 编码的`last_depth_image`，不是刚从ROS订阅读取、留给下一次编码的帧。
 
-NPZ v3视觉字段为：
+NPZ v4保留的视觉字段为：
 
 ```text
 visual_timestamp  float64 (N,)
@@ -221,9 +221,40 @@ visual_output     float32 (N, 34)
 ```
 
 `visual_records`继续使用容量50的`deque`，单帧深度占20184字节，50帧约1.01 MB。
-`flush()`先构建数组，再沿用`np.savez_compressed()`写临时文件和`os.replace()`原子
-替换；运行期不新增文件I/O。旧v1/v2读取端按字段名读取时不受影响，新读取端必须通过
-`format_version`或字段存在性兼容旧日志。
+旧v1/v2读取端按字段名读取时不受影响，新读取端必须通过`format_version`或字段存在性
+兼容旧日志。
+
+### 抗整机复位检查点
+
+`FlightRecorder`保留250周期/50帧内存环形缓冲，首个控制样本立即请求检查点，
+之后以`0.5 s`为默认间隔请求滚动检查点。请求在`record_control()`尾部只完成
+加锁快照和后台线程启动；
+`np.savez_compressed()`、磁盘写入和同步均不在50 Hz控制线程执行。同一时刻最多
+一个检查点工作线程；若上次压缩未完成，不排队新快照，完成后的下一个
+控制周期再采集最新环形缓冲。
+
+运行期文件为`extreme-flight-<start>-checkpoint.npz`，`reason`为
+`periodic_checkpoint`，`detail`为空。飞行NPZ升级为v4；软件急停的最终NPZ保留
+稳定的`reason`值，并在`detail`中保存具体关节和约束区间。写入顺序为：
+
+```text
+snapshot -> temporary NPZ -> flush -> fsync(file)
+         -> os.replace(checkpoint) -> fsync(output_dir)
+```
+
+因此复位若发生在临时文件写入中，上一份已同步的检查点仍是完整NPZ；临时文件
+可以丢弃。`flush(reason)`先等待已在运行的检查点，再用同一耐久写入路径生成
+最终时间戳NPZ；只在最终文件的文件与目录`fsync`均成功后清空环形缓冲、
+删除检查点并再次同步目录。后台异常存入线程安全错误槽，控制节点只限频读取并
+记录，不影响输出。
+
+2026-07-29验证：本地10项飞行记录和25项安全测试通过；Jetson端66项
+全套测试、语法检查及本地/远端SHA-256校验通过。Jetson上250控制周期和
+50帧随机深度的v4检查点为928661字节，同步调用耗时93.844 ms；生产中该调用
+在后台线程。同机5秒50 Hz合成循环的记录调用p50/p95/max为
+0.224/0.684/2.415 ms，0次超过20 ms周期。另一个50 Hz子进程运行2秒后被
+`SIGKILL`，不执行清盘仍成功读取v4检查点，恢复76个控制样本和16帧视觉样本。
+该验证未启动ROS、相机或真实LowCmd，也没有为测试主动重启Jetson。
 
 2026-07-29本地验证：Python 3.8.10下5项飞行记录聚焦测试和全套61项单元测试通过；
 `flight_recorder.py`、`run_extreme_parkour.py`语法检查及`git diff --check`通过。

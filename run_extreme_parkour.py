@@ -36,6 +36,7 @@ class Go2Node(UnitreeRos2Real):
         self.visual_update_interval = 5
         self.flight_recorder = FlightRecorder(flight_log_dir)
         self.flight_record_error_reported = False
+        self.flight_checkpoint_error_last_report_time = None
         self.pending_flight_reason = None
         self.runtime_status_pub = self.create_publisher(
             String,
@@ -190,6 +191,7 @@ class Go2Node(UnitreeRos2Real):
             if not self.flight_record_error_reported:
                 self.get_logger().error(f"Flight recorder rejected a sample: {error}")
                 self.flight_record_error_reported = True
+        self._report_flight_checkpoint_error(now)
         self._publish_runtime_status(
             now=now,
             command=command,
@@ -203,6 +205,18 @@ class Go2Node(UnitreeRos2Real):
             motor_tau_est=motor_tau_est,
             loop_s=loop_s,
         )
+
+    def _report_flight_checkpoint_error(self, now):
+        error = self.flight_recorder.pop_checkpoint_error()
+        if error is None:
+            return
+        if (
+            self.flight_checkpoint_error_last_report_time is not None
+            and now - self.flight_checkpoint_error_last_report_time < 5.0
+        ):
+            return
+        self.flight_checkpoint_error_last_report_time = now
+        self.get_logger().error(f"Flight checkpoint persistence failed: {error}")
 
     def _publish_runtime_status(
         self,
@@ -266,23 +280,28 @@ class Go2Node(UnitreeRos2Real):
                 )
                 self.runtime_status_error_reported = True
 
-    def flush_flight_record(self, reason):
+    def flush_flight_record(self, reason, detail=None):
         try:
-            path = self.flight_recorder.flush(reason)
+            path = self.flight_recorder.flush(reason, detail or "")
         except (OSError, ValueError) as error:
             self.get_logger().error(f"Failed to save flight record: {error}")
+            self._report_flight_checkpoint_error(time.monotonic())
             return None
+        self._report_flight_checkpoint_error(time.monotonic())
         if path is not None:
             self.get_logger().warning(f"Flight record saved: {path}")
         return path
 
-    def _emergency_stop(self, reason):
-        self.get_logger().error(
-            f"Emergency stop ({reason}): publishing the motor-off tail."
-        )
+    def _emergency_stop(self, reason, detail=None):
+        message = f"Emergency stop ({reason})"
+        if detail:
+            message += f": {detail}; publishing the motor-off tail."
+        else:
+            message += ": publishing the motor-off tail."
+        self.get_logger().error(message)
         self.policy_transition.reset()
         self.shutdown_outputs()
-        self.flush_flight_record(reason)
+        self.flush_flight_record(reason, detail)
         self.real_control_phase = "emergency_stop"
         self.use_stand_policy = False
         self.use_parkour_policy = False
@@ -299,7 +318,14 @@ class Go2Node(UnitreeRos2Real):
                 if isinstance(error, LowStateStaleError)
                 else "policy_target_infeasible"
             )
-            self._emergency_stop(reason)
+            detail = str(error)
+            if isinstance(error, PolicyTargetInfeasibleError):
+                joint_names = [
+                    self.dof_names[index]
+                    for index in error.joint_indices
+                ]
+                detail = f"joint_names={joint_names}; {detail}"
+            self._emergency_stop(reason, detail)
             return
         self.get_logger().error(
             f"Policy guard rejected the control cycle: {error}. "

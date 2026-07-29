@@ -498,7 +498,7 @@ class RealControlSafetyTest(unittest.TestCase):
             target,
             POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
         )
-        self.assertAlmostEqual(POLICY_TARGET_MAX_STEP_RAD, 0.20)
+        self.assertAlmostEqual(POLICY_TARGET_MAX_STEP_RAD, 0.21)
         self.assertAlmostEqual(POLICY_CALF_TARGET_MAX_STEP_RAD, 0.20)
 
     def test_policy_target_accepts_a_scalar_transition_step(self):
@@ -518,10 +518,7 @@ class RealControlSafetyTest(unittest.TestCase):
         np.testing.assert_allclose(target, POLICY_TRANSITION_MAX_STEP_RAD)
 
     def test_policy_target_rejects_an_empty_safe_intersection(self):
-        with self.assertRaisesRegex(
-            PolicyTargetInfeasibleError,
-            "no safe policy target",
-        ):
+        with self.assertRaises(PolicyTargetInfeasibleError) as captured:
             constrain_policy_target(
                 requested_q=np.zeros(12),
                 previous_q=np.ones(12),
@@ -533,6 +530,20 @@ class RealControlSafetyTest(unittest.TestCase):
                 joint_limits_high=np.full(12, 2.0),
                 torque_limits=np.ones(12),
             )
+
+        error = captured.exception
+        self.assertEqual(error.joint_indices, tuple(range(12)))
+        message = str(error)
+        self.assertIn("no safe policy target", message)
+        self.assertIn("joint=0", message)
+        self.assertIn("requested=+0.000000", message)
+        self.assertIn("previous=+1.000000", message)
+        self.assertIn("measured_q=-1.000000", message)
+        self.assertIn("measured_dq=+0.000000", message)
+        self.assertIn("step=[+0.800000,+1.200000]", message)
+        self.assertIn("joint_limit=[-2.000000,+2.000000]", message)
+        self.assertIn("pd_target=[-1.010000,-0.990000]", message)
+        self.assertIn("intersection=[+0.800000,-0.990000]", message)
 
 if __name__ == "__main__":
     unittest.main()

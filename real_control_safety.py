@@ -23,7 +23,7 @@ POLICY_PRIME_PROPRIO_SAMPLES = 10
 POLICY_PRIME_DEPTH_SAMPLES = 5
 POLICY_ENGAGEMENT_RAMP_S = 1.0
 POLICY_TRANSITION_MAX_STEP_RAD = 0.05
-POLICY_TARGET_MAX_STEP_RAD = 0.20
+POLICY_TARGET_MAX_STEP_RAD = 0.21
 POLICY_CALF_TARGET_MAX_STEP_RAD = 0.20
 POLICY_TARGET_MAX_STEP_RAD_BY_JOINT = (
     POLICY_TARGET_MAX_STEP_RAD,
@@ -52,6 +52,10 @@ class DepthStaleError(RealControlError):
 
 class PolicyTargetInfeasibleError(RealControlError):
     """Raised when no position target can satisfy every output bound."""
+
+    def __init__(self, message: str, joint_indices: Sequence[int]):
+        super().__init__(message)
+        self.joint_indices = tuple(int(index) for index in joint_indices)
 
 
 def release_mode_required(active_mode: str) -> bool:
@@ -611,8 +615,26 @@ def constrain_policy_target(
     lower = np.maximum.reduce((previous - max_step, joint_lower, torque_lower))
     upper = np.minimum.reduce((previous + max_step, joint_upper, torque_upper))
     if bool(np.any(lower > upper)):
-        joints = np.flatnonzero(lower > upper).tolist()
+        joints = np.flatnonzero(lower > upper)
+        details = []
+        for joint in joints:
+            details.append(
+                f"joint={int(joint)} "
+                f"requested={requested[joint]:+.6f} "
+                f"previous={previous[joint]:+.6f} "
+                f"measured_q={measured[joint]:+.6f} "
+                f"measured_dq={measured_velocity[joint]:+.6f} "
+                f"step=[{previous[joint] - max_step[joint]:+.6f},"
+                f"{previous[joint] + max_step[joint]:+.6f}] "
+                f"joint_limit=[{joint_lower[joint]:+.6f},"
+                f"{joint_upper[joint]:+.6f}] "
+                f"pd_target=[{torque_lower[joint]:+.6f},"
+                f"{torque_upper[joint]:+.6f}] "
+                f"intersection=[{lower[joint]:+.6f},"
+                f"{upper[joint]:+.6f}]"
+            )
         raise PolicyTargetInfeasibleError(
-            f"no safe policy target satisfies all bounds for joints {joints}"
+            "no safe policy target satisfies all bounds; " + "; ".join(details),
+            joints,
         )
     return np.clip(requested, lower, upper)

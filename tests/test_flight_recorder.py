@@ -1,8 +1,11 @@
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
+import flight_recorder as flight_recorder_module
 from flight_recorder import FlightRecorder
 
 
@@ -67,7 +70,7 @@ class FlightRecorderTest(unittest.TestCase):
                 self.assertEqual(data["motor_lost"].shape, (2, 12))
                 self.assertEqual(data["motor_tau_est"].shape, (2, 12))
                 self.assertEqual(data["contact_state"].shape, (2, 4))
-                self.assertEqual(data["format_version"].tolist(), [3])
+                self.assertEqual(data["format_version"].tolist(), [4])
                 self.assertEqual(data["depth_input"].shape, (1, 58, 87))
                 np.testing.assert_array_equal(data["depth_input"][0], latest_depth)
                 np.testing.assert_allclose(
@@ -78,6 +81,7 @@ class FlightRecorderTest(unittest.TestCase):
                 )
                 self.assertEqual(data["visual_output"].shape, (1, 34))
                 self.assertEqual(data["reason"].tolist(), ["unit_test"])
+                self.assertEqual(data["detail"].tolist(), [""])
                 self.assertEqual(data["visual_timestamp"].tolist(), [101.0])
 
             self.assertEqual(len(recorder.control_records), 0)
@@ -134,6 +138,92 @@ class FlightRecorderTest(unittest.TestCase):
                 self.assertEqual(data["depth_input"].shape, (0, 58, 87))
                 self.assertEqual(data["depth_stats"].shape, (0, 3))
                 self.assertEqual(data["visual_output"].shape, (0, 34))
+
+    def test_checkpoint_is_loadable_and_syncs_file_and_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            self._record_control(recorder, 0)
+            recorder.record_visual(
+                timestamp=100.0,
+                depth_input=np.zeros((58, 87), dtype=np.float32),
+                visual_output=np.zeros(34),
+            )
+
+            with mock.patch.object(
+                flight_recorder_module.os,
+                "fsync",
+                wraps=os.fsync,
+            ) as fsync:
+                path = recorder.checkpoint()
+
+            self.assertEqual(path, recorder.checkpoint_path)
+            self.assertGreaterEqual(fsync.call_count, 2)
+            with np.load(path, allow_pickle=False) as data:
+                self.assertEqual(data["reason"].tolist(), ["periodic_checkpoint"])
+                self.assertEqual(data["detail"].tolist(), [""])
+                self.assertEqual(data["control_timestamp"].tolist(), [100.0])
+                self.assertEqual(data["depth_input"].shape, (1, 58, 87))
+
+    def test_due_checkpoint_runs_in_a_background_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(
+                directory,
+                checkpoint_interval_s=1e-9,
+            )
+            self._record_control(recorder, 0)
+            recorder._wait_for_pending_checkpoint()
+
+            self.assertTrue(recorder.checkpoint_path.exists())
+            with np.load(recorder.checkpoint_path, allow_pickle=False) as data:
+                self.assertEqual(data["reason"].tolist(), ["periodic_checkpoint"])
+                self.assertEqual(data["control_timestamp"].tolist(), [100.0])
+
+    def test_incomplete_temporary_write_keeps_previous_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            self._record_control(recorder, 0)
+            path = recorder.checkpoint()
+            temporary_path = path.with_name(f".{path.name}.tmp")
+            temporary_path.write_bytes(b"incomplete reset-interrupted data")
+
+            with np.load(path, allow_pickle=False) as data:
+                self.assertEqual(data["control_timestamp"].tolist(), [100.0])
+                self.assertEqual(data["reason"].tolist(), ["periodic_checkpoint"])
+
+    def test_flush_failure_preserves_checkpoint_and_ring_buffers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            self._record_control(recorder, 0)
+            checkpoint_path = recorder.checkpoint()
+            self._record_control(recorder, 1)
+
+            with mock.patch.object(
+                recorder,
+                "_write_payload_durable",
+                side_effect=OSError("injected write failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected write failure"):
+                    recorder.flush("unit_test")
+
+            self.assertTrue(checkpoint_path.exists())
+            self.assertEqual(len(recorder.control_records), 2)
+            with np.load(checkpoint_path, allow_pickle=False) as data:
+                self.assertEqual(data["control_timestamp"].tolist(), [100.0])
+
+    def test_successful_flush_removes_durable_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            self._record_control(recorder, 0)
+            checkpoint_path = recorder.checkpoint()
+
+            final_path = recorder.flush("unit_test", "joint=RR_thigh")
+
+            self.assertFalse(checkpoint_path.exists())
+            self.assertTrue(final_path.exists())
+            with np.load(final_path, allow_pickle=False) as data:
+                self.assertEqual(data["reason"].tolist(), ["unit_test"])
+                self.assertEqual(data["detail"].tolist(), ["joint=RR_thigh"])
+                self.assertEqual(data["control_timestamp"].tolist(), [100.0])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,30 @@
 本次修改集中在新增`depth_processing.py`、测试以及`visual_extreme_parkour.py`，
 可按聚焦diff逐文件撤销，不影响模型文件。
 
+## 整机复位时的飞行日志持久化
+
+用户目标是Jetson发生突发`MAINSWRST`时，仍能恢复复位前最近的policy、
+关节、足力和深度输入，不再依赖R2、L2、异常或正常退出触发一次性NPZ写入。
+
+验收标准：
+
+- 首个控制样本立即启动首份后台检查点，之后每`0.5 s`最多启动一次；控制线程不执行压缩、
+  文件写入或`fsync`。
+- 检查点沿用飞行NPZ字段，文件名显式带`checkpoint`，可直接被现有
+  NumPy分析工具读取。
+- 每次检查点先完整写入临时文件，然后对文件执行`fsync`、原子替换并
+  对父目录执行`fsync`；复位发生在任意写入阶段时，上一份完整检查点
+  仍保留。
+- 正常清盘先持久化最终时间戳NPZ，只有该文件成功后才删除检查点并
+  同步父目录；最终写入失败时不清空内存记录或删除已持久化检查点。
+- 飞行NPZ升级为v4，保留稳定的`reason`并新增`detail`；软件急停的最终
+  NPZ必须保存具体关节和约束区间，周期检查点的`detail`为空。
+- 后台记录失败只限频告警，不改变LowCmd、接管状态或急停逻辑。
+
+非目标：该修改不防止或定位`MAINSWRST`本身，也不代替Jetson的持久化
+system journal/pstore。回滚时可撤销`flight_recorder.py`的检查点工作线程及
+`run_extreme_parkour.py`的错误告警接入，最终NPZ schema无需回滚。
+
 ## Dry-run输出隔离
 
 - 默认dry-run只发布到随机`/lowcmd_dryrun_<id>`话题。
