@@ -72,7 +72,7 @@ Sport Mode + model warm-up
 -> stand_hold
 -> Y rising edge
 -> policy_engagement: 1 s quintic blend, <=0.05 rad/cycle
--> policy: hip/thigh <=0.20, calf <=0.40 rad/cycle, continuous constraints
+-> policy: hip/thigh <=0.30, calf <=0.40 rad/cycle, continuous constraints
 ```
 
 MotionSwitcher RPC每次2秒超时，最多3次。publisher对象可以在ReleaseMode前创建，
@@ -100,7 +100,7 @@ raw_action (12 finite values)
 
 `self.actions`保存actor原始输出，因为训练环境在延迟和裁剪之前写入动作历史。输出
 保护后的执行动作只进入飞行记录。每个policy周期先验证LowState和深度年龄不超过
-0.25秒，再将请求目标与上一命令的hip/thigh `±0.20 rad`、calf `±0.40 rad`范围、
+0.25秒，再将请求目标与上一命令的hip/thigh `±0.30 rad`、calf `±0.40 rad`范围、
 机械关节范围及由最新`q/dq/Kp/Kd`
 推导出的PD力矩可行区间求交。深度超时进入站姿恢复；可行交集为空时恢复轨迹也
 无法同时满足约束，因此与LowState超时一样发送motor-off尾帧并锁定在

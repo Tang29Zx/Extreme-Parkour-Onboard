@@ -77,7 +77,7 @@ CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命�
 - prime完成后等待Y期间仍以50 Hz观察累计`lost`计数；发现增长会立即自动重新prime，
   连续稳定0.5秒后重新接受Y，不会把几分钟前已经稳定的增长延迟到按Y时才拒绝。
 - 短按并释放 **Y** 进入策略；前1秒以五次曲线接入且每周期最多变化0.05 rad，
-  第1秒相对起点还限制在0.3 rad以内。接入完成后hip/thigh以0.20 rad/周期、calf
+  第1秒相对起点还限制在0.3 rad以内。接入完成后hip/thigh以0.30 rad/周期、calf
   以0.40 rad/周期持续限制目标变化、机械关节范围和估算PD力矩；策略观测中的
   `last_actions`保持上一帧actor原始输出。
   接入后不根据姿态自动motor-off。
@@ -163,7 +163,7 @@ EXTREME_GROUND_NOISE_SEED=17 \
 加入`--headless`执行无窗口验收；使用`EXTREME_BOUNDARY_COMPARISON=fixed`只运行绿色
 边界。`EXTREME_BOUNDARY_GUARDS=mapping`保留1秒接入渐变但关闭稳态输出约束，只用于
 隔离顺序、观测和LowCmd往返问题，不能代表真机安全链。默认`full`会执行生产端每周期
-输入检查、接入期0.05 rad/周期、稳态hip/thigh 0.20 rad/周期、calf 0.40 rad/周期、
+输入检查、接入期0.05 rad/周期、稳态hip/thigh 0.30 rad/周期、calf 0.40 rad/周期、
 机械限位和估算PD力矩约束。
 关节速度检查对URDF标称上限保留0.5%测量容差，超出该容差仍会停止策略。
 回放使用与生产端相同的遥控器上升沿逻辑，自动注入一次L1和一次Y；L1前不授权

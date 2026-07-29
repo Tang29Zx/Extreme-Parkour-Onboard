@@ -498,7 +498,7 @@ class RealControlSafetyTest(unittest.TestCase):
             target,
             POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
         )
-        self.assertAlmostEqual(POLICY_TARGET_MAX_STEP_RAD, 0.20)
+        self.assertAlmostEqual(POLICY_TARGET_MAX_STEP_RAD, 0.30)
         self.assertAlmostEqual(POLICY_CALF_TARGET_MAX_STEP_RAD, 0.40)
 
     def test_policy_target_accepts_a_scalar_transition_step(self):
