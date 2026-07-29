@@ -30,6 +30,7 @@ from real_control_safety import (
     RPC_MAX_ATTEMPTS,
     RPC_TIMEOUT_S,
     POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT,
     STARTUP_RAMP_S,
     TAKEOVER_HOLD_S,
     DepthStaleError,
@@ -1152,10 +1153,11 @@ class UnitreeRos2Real(Node):
 
         if self.last_command_target_q is None:
             raise RealControlError("previous joint target is unavailable")
+        previous_target = self.last_command_target_q.copy()
         measured_q, measured_dq = self._current_joint_state()
         commanded_target = constrain_policy_target(
             transition_target,
-            self.last_command_target_q,
+            previous_target,
             measured_q,
             measured_dq,
             self.p_gains_np,
@@ -1168,6 +1170,11 @@ class UnitreeRos2Real(Node):
                 if engagement_active
                 else POLICY_TARGET_MAX_STEP_RAD_BY_JOINT
             ),
+            escape_max_step_rad=(
+                None
+                if engagement_active
+                else POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT
+            ),
         )
         if engagement_active:
             self.policy_transition.record_executed_target(commanded_target)
@@ -1178,6 +1185,41 @@ class UnitreeRos2Real(Node):
                 )
 
         self._publish_legs_cmd(commanded_target, stand=False)
+        if not engagement_active:
+            ordinary_max_step = np.asarray(
+                POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+                dtype=np.float64,
+            )
+            escape_indices = np.flatnonzero(
+                np.abs(commanded_target - previous_target)
+                > ordinary_max_step + 1e-9
+            )
+            if escape_indices.size:
+                escape_details = []
+                for joint in escape_indices:
+                    previous_torque = (
+                        self.p_gains_np[joint]
+                        * (previous_target[joint] - measured_q[joint])
+                        - self.d_gains_np[joint] * measured_dq[joint]
+                    )
+                    commanded_torque = (
+                        self.p_gains_np[joint]
+                        * (commanded_target[joint] - measured_q[joint])
+                        - self.d_gains_np[joint] * measured_dq[joint]
+                    )
+                    escape_details.append(
+                        f"joint={SIM_DOF_NAMES[joint]} "
+                        f"previous={previous_target[joint]:+.6f} "
+                        f"commanded={commanded_target[joint]:+.6f} "
+                        f"measured_q={measured_q[joint]:+.6f} "
+                        f"measured_dq={measured_dq[joint]:+.6f} "
+                        f"predicted_tau={previous_torque:+.6f}->"
+                        f"{commanded_torque:+.6f}"
+                    )
+                self.get_logger().warning(
+                    "Torque-safe target step escape applied: "
+                    + "; ".join(escape_details)
+                )
         return {
             "phase": self.real_control_phase,
             "raw_action": raw_action.copy(),

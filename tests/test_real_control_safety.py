@@ -10,6 +10,8 @@ from real_control_safety import (
     POLICY_TARGET_MAX_DEVIATION_RAD,
     POLICY_TARGET_MAX_STEP_RAD,
     POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD,
+    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT,
     POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE,
     PolicyTargetInfeasibleError,
     PolicyPrimeGate,
@@ -500,6 +502,11 @@ class RealControlSafetyTest(unittest.TestCase):
         )
         self.assertAlmostEqual(POLICY_TARGET_MAX_STEP_RAD, 0.21)
         self.assertAlmostEqual(POLICY_CALF_TARGET_MAX_STEP_RAD, 0.20)
+        self.assertAlmostEqual(POLICY_TORQUE_ESCAPE_MAX_STEP_RAD, 0.30)
+        np.testing.assert_allclose(
+            POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT,
+            [0.30, 0.30, 0.20] * 4,
+        )
 
     def test_policy_target_accepts_a_scalar_transition_step(self):
         target = constrain_policy_target(
@@ -516,6 +523,140 @@ class RealControlSafetyTest(unittest.TestCase):
         )
 
         np.testing.assert_allclose(target, POLICY_TRANSITION_MAX_STEP_RAD)
+
+    def test_policy_target_uses_torque_safe_escape_for_rr_thigh_rebound(self):
+        requested = np.zeros(12)
+        previous = np.zeros(12)
+        measured = np.zeros(12)
+        velocity = np.zeros(12)
+        joint = 7
+        requested[joint] = -0.2
+        previous[joint] = -0.013357
+        measured[joint] = 0.796217
+        velocity[joint] = 2.600477
+        kp = np.full(12, 40.0)
+        kd = np.ones(12)
+        torque = np.full(12, 23.7)
+
+        target = constrain_policy_target(
+            requested,
+            previous,
+            measured,
+            velocity,
+            kp,
+            kd,
+            np.full(12, -2.0),
+            np.full(12, 2.0),
+            torque,
+            max_step_rad=POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+            escape_max_step_rad=POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT,
+        )
+
+        expected = measured[joint] + (
+            -torque[joint] + kd[joint] * velocity[joint]
+        ) / kp[joint]
+        self.assertAlmostEqual(target[joint], expected)
+        self.assertGreater(
+            abs(target[joint] - previous[joint]),
+            POLICY_TARGET_MAX_STEP_RAD,
+        )
+        self.assertLessEqual(
+            abs(target[joint] - previous[joint]),
+            POLICY_TORQUE_ESCAPE_MAX_STEP_RAD,
+        )
+        self.assertLess(
+            abs(target[joint] - measured[joint]),
+            abs(previous[joint] - measured[joint]),
+        )
+        predicted_torque = (
+            kp[joint] * (target[joint] - measured[joint])
+            - kd[joint] * velocity[joint]
+        )
+        self.assertAlmostEqual(predicted_torque, -torque[joint])
+
+    def test_policy_target_does_not_escape_during_transition(self):
+        requested = np.zeros(12)
+        previous = np.zeros(12)
+        measured = np.zeros(12)
+        velocity = np.zeros(12)
+        joint = 7
+        requested[joint] = -0.2
+        previous[joint] = -0.013357
+        measured[joint] = 0.796217
+        velocity[joint] = 2.600477
+
+        with self.assertRaises(PolicyTargetInfeasibleError):
+            constrain_policy_target(
+                requested,
+                previous,
+                measured,
+                velocity,
+                np.full(12, 40.0),
+                np.ones(12),
+                np.full(12, -2.0),
+                np.full(12, 2.0),
+                np.full(12, 23.7),
+                max_step_rad=POLICY_TRANSITION_MAX_STEP_RAD,
+                escape_max_step_rad=None,
+            )
+
+    def test_policy_target_does_not_escape_calf(self):
+        requested = np.zeros(12)
+        previous = np.zeros(12)
+        measured = np.zeros(12)
+        velocity = np.zeros(12)
+        joint = 8
+        requested[joint] = -0.2
+        previous[joint] = -0.013357
+        measured[joint] = 0.796217
+        velocity[joint] = 2.600477
+
+        with self.assertRaises(PolicyTargetInfeasibleError) as captured:
+            constrain_policy_target(
+                requested,
+                previous,
+                measured,
+                velocity,
+                np.full(12, 40.0),
+                np.ones(12),
+                np.full(12, -2.0),
+                np.full(12, 2.0),
+                np.full(12, 23.7),
+                max_step_rad=POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+                escape_max_step_rad=(
+                    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT
+                ),
+            )
+
+        self.assertEqual(captured.exception.joint_indices, (joint,))
+
+    def test_policy_target_rejects_state_requiring_more_than_escape(self):
+        requested = np.zeros(12)
+        previous = np.zeros(12)
+        measured = np.zeros(12)
+        joint = 7
+        requested[joint] = -0.2
+        previous[joint] = -0.013357
+        measured[joint] = 1.0
+
+        with self.assertRaises(PolicyTargetInfeasibleError) as captured:
+            constrain_policy_target(
+                requested,
+                previous,
+                measured,
+                np.zeros(12),
+                np.full(12, 40.0),
+                np.ones(12),
+                np.full(12, -2.0),
+                np.full(12, 2.0),
+                np.full(12, 23.7),
+                max_step_rad=POLICY_TARGET_MAX_STEP_RAD_BY_JOINT,
+                escape_max_step_rad=(
+                    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT
+                ),
+            )
+
+        self.assertEqual(captured.exception.joint_indices, (joint,))
 
     def test_policy_target_rejects_an_empty_safe_intersection(self):
         with self.assertRaises(PolicyTargetInfeasibleError) as captured:
@@ -540,10 +681,10 @@ class RealControlSafetyTest(unittest.TestCase):
         self.assertIn("previous=+1.000000", message)
         self.assertIn("measured_q=-1.000000", message)
         self.assertIn("measured_dq=+0.000000", message)
-        self.assertIn("step=[+0.800000,+1.200000]", message)
+        self.assertIn("step=[+0.790000,+1.210000]", message)
         self.assertIn("joint_limit=[-2.000000,+2.000000]", message)
         self.assertIn("pd_target=[-1.010000,-0.990000]", message)
-        self.assertIn("intersection=[+0.800000,-0.990000]", message)
+        self.assertIn("intersection=[+0.790000,-0.990000]", message)
 
 if __name__ == "__main__":
     unittest.main()

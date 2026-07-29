@@ -2,7 +2,7 @@
 
 import json
 import math
-from typing import Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -30,6 +30,13 @@ POLICY_TARGET_MAX_STEP_RAD_BY_JOINT = (
     POLICY_TARGET_MAX_STEP_RAD,
     POLICY_CALF_TARGET_MAX_STEP_RAD,
 ) * 4
+POLICY_TORQUE_ESCAPE_MAX_STEP_RAD = 0.30
+POLICY_TORQUE_ESCAPE_MAX_STEP_RAD_BY_JOINT = (
+    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD,
+    POLICY_TORQUE_ESCAPE_MAX_STEP_RAD,
+    POLICY_CALF_TARGET_MAX_STEP_RAD,
+) * 4
+POLICY_TORQUE_ESCAPE_TOLERANCE = 1e-9
 POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE = 0.005
 POLICY_TARGET_MAX_DEVIATION_RAD = 0.30
 POLICY_STATE_LIMIT_TOLERANCE_RAD = 0.05
@@ -575,8 +582,15 @@ def constrain_policy_target(
     max_step_rad: Union[float, Sequence[float]] = (
         POLICY_TARGET_MAX_STEP_RAD_BY_JOINT
     ),
+    escape_max_step_rad: Optional[Union[float, Sequence[float]]] = None,
 ) -> np.ndarray:
-    """Intersect step, joint, and estimated PD-torque bounds for one target."""
+    """Intersect step, joint, and estimated PD-torque bounds for one target.
+
+    A larger escape step may be supplied for joints whose previous target has
+    become torque-unsafe. It is used only when the ordinary intersection is
+    empty and the escaped command moves toward measured position while reducing
+    absolute predicted PD torque.
+    """
     requested = _joint_vector(requested_q, "requested joint target")
     previous = _joint_vector(previous_q, "previous joint target")
     measured = _joint_vector(measured_q, "measured joint position")
@@ -601,6 +615,41 @@ def constrain_policy_target(
 
     if not np.isfinite(max_step).all() or bool(np.any(max_step <= 0.0)):
         raise RealControlError("policy target steps must be positive and finite")
+
+    escape_max_step = None
+    if escape_max_step_rad is not None:
+        escape_max_step_value = np.asarray(
+            escape_max_step_rad,
+            dtype=np.float64,
+        )
+        if escape_max_step_value.ndim == 0:
+            escape_max_step = np.full(
+                12,
+                float(escape_max_step_value),
+                dtype=np.float64,
+            )
+        elif escape_max_step_value.shape == (12,):
+            escape_max_step = escape_max_step_value.copy()
+        else:
+            raise RealControlError(
+                "policy target escape step must be a scalar or contain "
+                "12 values"
+            )
+        if not np.isfinite(escape_max_step).all() or bool(
+            np.any(escape_max_step <= 0.0)
+        ):
+            raise RealControlError(
+                "policy target escape steps must be positive and finite"
+            )
+        if bool(
+            np.any(
+                escape_max_step
+                < max_step - POLICY_TORQUE_ESCAPE_TOLERANCE
+            )
+        ):
+            raise RealControlError(
+                "policy target escape steps must not be below ordinary steps"
+            )
     if bool(np.any(p_gain <= 0.0)):
         raise RealControlError("joint proportional gains must be positive")
     if bool(np.any(d_gain < 0.0)):
@@ -612,8 +661,47 @@ def constrain_policy_target(
 
     torque_lower = measured + (-torque + d_gain * measured_velocity) / p_gain
     torque_upper = measured + (torque + d_gain * measured_velocity) / p_gain
-    lower = np.maximum.reduce((previous - max_step, joint_lower, torque_lower))
-    upper = np.minimum.reduce((previous + max_step, joint_upper, torque_upper))
+    torque_safe_lower = np.maximum(joint_lower, torque_lower)
+    torque_safe_upper = np.minimum(joint_upper, torque_upper)
+    lower = np.maximum(previous - max_step, torque_safe_lower)
+    upper = np.minimum(previous + max_step, torque_safe_upper)
+
+    if escape_max_step is not None and bool(np.any(lower > upper)):
+        previous_predicted_torque = (
+            p_gain * (previous - measured) - d_gain * measured_velocity
+        )
+        escape_lower = np.maximum(
+            previous - escape_max_step,
+            torque_safe_lower,
+        )
+        escape_upper = np.minimum(
+            previous + escape_max_step,
+            torque_safe_upper,
+        )
+        escape_candidate = np.clip(requested, escape_lower, escape_upper)
+        escape_predicted_torque = (
+            p_gain * (escape_candidate - measured)
+            - d_gain * measured_velocity
+        )
+        tolerance = POLICY_TORQUE_ESCAPE_TOLERANCE
+        escape_allowed = (
+            (lower > upper)
+            & (torque_safe_lower <= torque_safe_upper)
+            & (escape_lower <= escape_upper)
+            & (escape_max_step > max_step + tolerance)
+            & (np.abs(previous_predicted_torque) > torque + tolerance)
+            & (
+                np.abs(escape_candidate - measured)
+                < np.abs(previous - measured) - tolerance
+            )
+            & (
+                np.abs(escape_predicted_torque)
+                < np.abs(previous_predicted_torque) - tolerance
+            )
+        )
+        lower = np.where(escape_allowed, escape_lower, lower)
+        upper = np.where(escape_allowed, escape_upper, upper)
+
     if bool(np.any(lower > upper)):
         joints = np.flatnonzero(lower > upper)
         details = []
