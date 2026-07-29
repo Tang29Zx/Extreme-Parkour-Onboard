@@ -90,7 +90,8 @@ CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命�
 - `Ctrl+C`退出时也会发送10帧motor-off命令，因此只能在支架承重时停止。
 - `--flight-log-dir`可指定飞行记录目录，默认`~/extreme-flight-logs`；L2、R2、
   异常或退出时会保存最近5秒数据并在日志中打印文件路径。记录包含12电机温度、
-  `lost`、估算力矩和四足接触判定。
+  `lost`、估算力矩、四足接触判定，以及与每次视觉编码严格对应的`58×87`
+  归一化深度输入。深度保存在NPZ的`depth_input`字段，不在控制循环逐帧写磁盘。
 
 控制节点运行后，可在第三个终端只读查看2 Hz实时状态：
 
@@ -199,6 +200,11 @@ pitch下界由-20.3°变为-22.3°。这只是20 cm单箱的一次确定性对�
 越过单箱，0 reset、0 fault；四个calf稳态最大步进均为0.40 rad，四个thigh均为
 0.20 rad，hip最高0.160 rad。最大预测力矩比例达到1.00，仍由PD力矩交集限制；该
 结果不代表0.45 m箱体或真机安全性。
+
+2026-07-29曾将hip/thigh保持0.30 rad、calf从0.40降到0.32 rad，并以完全相同的
+seed 17/18随机化样本复测0.25 m单箱共40局：成功由12/40降至8/40，安全硬停由
+7次增至13次，最大实测速度比例由1.086升至1.432。固定降低calf目标步长没有降低
+实测速度风险；实验后已回滚到0.40，0.32从未同步Jetson或授权真机接管。
 
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
 

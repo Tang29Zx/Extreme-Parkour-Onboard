@@ -100,9 +100,14 @@ class Go2Node(UnitreeRos2Real):
     def _record_visual_sample(self, depth_image, visual_output):
         depth = depth_image.detach().cpu().numpy()
         output = visual_output.detach().cpu().numpy().reshape(-1)
+        if depth.shape != (1, 58, 87):
+            raise ValueError(
+                "Recorded policy depth must have shape (1, 58, 87), "
+                f"got {depth.shape}."
+            )
         self.flight_recorder.record_visual(
             timestamp=time.monotonic(),
-            depth_stats=(float(depth.min()), float(depth.max()), float(depth.mean())),
+            depth_input=depth[0],
             visual_output=output,
         )
 

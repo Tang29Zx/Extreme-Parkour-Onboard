@@ -40,12 +40,18 @@ class FlightRecorderTest(unittest.TestCase):
                 self._record_control(recorder, index)
             recorder.record_visual(
                 timestamp=100.0,
-                depth_stats=(-0.5, 0.5, 0.0),
+                depth_input=np.zeros((58, 87), dtype=np.float32),
                 visual_output=np.zeros(34),
             )
+            latest_depth = np.linspace(
+                -0.4,
+                0.4,
+                num=58 * 87,
+                dtype=np.float32,
+            ).reshape(58, 87)
             recorder.record_visual(
                 timestamp=101.0,
-                depth_stats=(-0.4, 0.4, 0.1),
+                depth_input=latest_depth,
                 visual_output=np.ones(34),
             )
 
@@ -61,7 +67,15 @@ class FlightRecorderTest(unittest.TestCase):
                 self.assertEqual(data["motor_lost"].shape, (2, 12))
                 self.assertEqual(data["motor_tau_est"].shape, (2, 12))
                 self.assertEqual(data["contact_state"].shape, (2, 4))
-                self.assertEqual(data["format_version"].tolist(), [2])
+                self.assertEqual(data["format_version"].tolist(), [3])
+                self.assertEqual(data["depth_input"].shape, (1, 58, 87))
+                np.testing.assert_array_equal(data["depth_input"][0], latest_depth)
+                np.testing.assert_allclose(
+                    data["depth_stats"][0],
+                    (latest_depth.min(), latest_depth.max(), latest_depth.mean()),
+                    rtol=0.0,
+                    atol=1e-7,
+                )
                 self.assertEqual(data["visual_output"].shape, (1, 34))
                 self.assertEqual(data["reason"].tolist(), ["unit_test"])
                 self.assertEqual(data["visual_timestamp"].tolist(), [101.0])
@@ -73,10 +87,22 @@ class FlightRecorderTest(unittest.TestCase):
     def test_nonfinite_sample_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             recorder = FlightRecorder(directory)
+            depth_input = np.zeros((58, 87), dtype=np.float32)
+            depth_input[0, 0] = np.nan
             with self.assertRaisesRegex(ValueError, "finite"):
                 recorder.record_visual(
                     timestamp=0.0,
-                    depth_stats=(0.0, np.nan, 0.0),
+                    depth_input=depth_input,
+                    visual_output=np.zeros(34),
+                )
+
+    def test_wrong_depth_shape_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            with self.assertRaisesRegex(ValueError, "shape"):
+                recorder.record_visual(
+                    timestamp=0.0,
+                    depth_input=np.zeros((58, 86), dtype=np.float32),
                     visual_output=np.zeros(34),
                 )
 
@@ -85,7 +111,7 @@ class FlightRecorderTest(unittest.TestCase):
             recorder = FlightRecorder(directory)
             recorder.record_visual(
                 timestamp=1.0,
-                depth_stats=(-0.5, 0.5, 0.0),
+                depth_input=np.zeros((58, 87), dtype=np.float32),
                 visual_output=np.zeros(34),
             )
 
@@ -95,6 +121,19 @@ class FlightRecorderTest(unittest.TestCase):
                 self.assertEqual(data["imu_quaternion"].shape, (0, 4))
                 self.assertEqual(data["input_ages"].shape, (0, 3))
                 self.assertEqual(data["motor_temperature"].shape, (0, 12))
+                self.assertEqual(data["depth_input"].shape, (1, 58, 87))
+
+    def test_control_only_record_keeps_visual_shapes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            self._record_control(recorder, 0)
+
+            path = recorder.flush("control_only")
+            with np.load(path, allow_pickle=False) as data:
+                self.assertEqual(data["visual_timestamp"].shape, (0,))
+                self.assertEqual(data["depth_input"].shape, (0, 58, 87))
+                self.assertEqual(data["depth_stats"].shape, (0, 3))
+                self.assertEqual(data["visual_output"].shape, (0, 34))
 
 
 if __name__ == "__main__":

@@ -203,6 +203,33 @@ LowState反馈超时仍是硬停止条件。R2保留为人工motor-off急停，L
 `motor_temperature(12)`、`motor_lost(12)`和`motor_tau_est(12)`。这些字段只进入内存
 环形缓冲，磁盘写入仍只发生在L2、R2、异常或退出路径。
 
+## 飞行记录深度输入格式
+
+`Go2Node._record_visual_sample()`接收的`depth_image`就是本次传给`depth_encode()`的
+张量。记录端在同一函数内只做一次CPU转换，将批次维去掉后交给`FlightRecorder`；
+记录器验证固定`(58,87)`形状和有限值，再从同一数组计算`depth_stats`，避免统计量与
+保存图像来自不同帧。策略循环现有的一帧视觉流水线保持不变：保存的是实际参与本次
+编码的`last_depth_image`，不是刚从ROS订阅读取、留给下一次编码的帧。
+
+NPZ v3视觉字段为：
+
+```text
+visual_timestamp  float64 (N,)
+depth_input       float32 (N, 58, 87)
+depth_stats       float32 (N, 3)       # min, max, mean of depth_input
+visual_output     float32 (N, 34)
+```
+
+`visual_records`继续使用容量50的`deque`，单帧深度占20184字节，50帧约1.01 MB。
+`flush()`先构建数组，再沿用`np.savez_compressed()`写临时文件和`os.replace()`原子
+替换；运行期不新增文件I/O。旧v1/v2读取端按字段名读取时不受影响，新读取端必须通过
+`format_version`或字段存在性兼容旧日志。
+
+2026-07-29本地验证：Python 3.8.10下5项飞行记录聚焦测试和全套61项单元测试通过；
+`flight_recorder.py`、`run_extreme_parkour.py`语法检查及`git diff --check`通过。
+验证覆盖50帧环形淘汰后的逐值保存、统计量同源、无视觉样本固定形状，以及非有限值和
+错误尺寸拒绝；未连接ROS、D435i、Jetson或真机。
+
 2026-07-27本地验证：19个真实控制安全测试及全套43个单元测试通过；修改后的运行
 模块通过Python 3.8语法检查，`git diff --check`通过。尚未同步Jetson，也未连接
 ROS图、D435i或真机。
@@ -282,6 +309,13 @@ LowCmd到PhysX目标差异。红色旧映射在入口检查被拒绝，故保持
 `x=3.40 m`，0 reset、0 fault。四个calf稳态最大步进均为0.40 rad，四个thigh均为
 0.20 rad，hip最大0.1599 rad；最大预测力矩比例1.00，机械和PD力矩边界检查通过。
 S2S摘要保存逐关节稳态最大步进并将其纳入PASS条件。
+
+2026-07-29将hip/thigh保持0.30 rad并把calf从0.40降到0.32 rad，使用与0.40档逐环境
+一致的seed 17/18随机化样本复测0.25 m单箱。40局成功由12降至8，安全硬停由7增至
+13；其中9次为实测速度越界、4次为calf步长/机械/PD联合可行区间为空。目标步长
+命中率由6.83%升至9.85%，最大实测速度比例由1.086升至1.432。该结果否定“固定
+缩小calf步长即可降低速度硬停”的假设，但不改变20.07 rad/s旧URDF速度边界；实验
+后生产同源常量已回滚到0.40，0.32不构成Jetson或真机验收。
 
 同机非headless短跑在创建场景前由Isaac Gym进程以退出码139结束；`DISPLAY=:0`可访问，
 RTX 5070 Ti和580.159.03驱动可被`nvidia-smi`识别，CPU headless正常。当前证据只能确认

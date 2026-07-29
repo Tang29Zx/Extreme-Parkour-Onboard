@@ -11,12 +11,23 @@ import numpy as np
 
 CONTROL_CAPACITY = 250
 VISUAL_CAPACITY = 50
+DEPTH_INPUT_SHAPE = (58, 87)
+FORMAT_VERSION = 3
 
 
 def _finite_vector(values: Sequence[float], size: int, name: str) -> np.ndarray:
     result = np.asarray(values, dtype=np.float32)
     if result.shape != (size,) or not np.isfinite(result).all():
         raise ValueError(f"{name} must contain {size} finite values")
+    return result.copy()
+
+
+def _finite_depth_input(values: Sequence[Sequence[float]]) -> np.ndarray:
+    result = np.asarray(values, dtype=np.float32)
+    if result.shape != DEPTH_INPUT_SHAPE or not np.isfinite(result).all():
+        raise ValueError(
+            "depth input must have shape (58, 87) and contain finite values"
+        )
     return result.copy()
 
 
@@ -95,16 +106,19 @@ class FlightRecorder:
         self,
         *,
         timestamp: float,
-        depth_stats: Sequence[float],
+        depth_input: Sequence[Sequence[float]],
         visual_output: Sequence[float],
     ) -> None:
         if not np.isfinite(float(timestamp)):
             raise ValueError("visual timestamp must be finite")
+        depth = _finite_depth_input(depth_input)
         self.visual_records.append(
             {
                 "timestamp": float(timestamp),
-                "depth_stats": _finite_vector(
-                    depth_stats, 3, "depth min/max/mean"
+                "depth_input": depth,
+                "depth_stats": np.asarray(
+                    [depth.min(), depth.max(), depth.mean()],
+                    dtype=np.float32,
                 ),
                 "visual_output": _finite_vector(
                     visual_output, 34, "visual output"
@@ -124,7 +138,7 @@ class FlightRecorder:
         controls = list(self.control_records)
         visuals = list(self.visual_records)
         payload = {
-            "format_version": np.asarray([2], dtype=np.int32),
+            "format_version": np.asarray([FORMAT_VERSION], dtype=np.int32),
             "reason": np.asarray([str(reason)]),
             "control_timestamp": np.asarray(
                 [record["timestamp"] for record in controls], dtype=np.float64
@@ -163,6 +177,9 @@ class FlightRecorder:
         payload["visual_timestamp"] = np.asarray(
             [record["timestamp"] for record in visuals], dtype=np.float64
         )
+        payload["depth_input"] = np.stack(
+            [record["depth_input"] for record in visuals], axis=0
+        ) if visuals else np.empty((0,) + DEPTH_INPUT_SHAPE, dtype=np.float32)
         payload["depth_stats"] = np.stack(
             [record["depth_stats"] for record in visuals], axis=0
         ) if visuals else np.empty((0, 3), dtype=np.float32)
