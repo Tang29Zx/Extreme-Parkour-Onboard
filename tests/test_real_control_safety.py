@@ -148,7 +148,11 @@ class RealControlSafetyTest(unittest.TestCase):
                 velocity_limits,
             )
         position[2] = 1.051
-        with self.assertRaisesRegex(RealControlError, "position"):
+        with self.assertRaisesRegex(
+            RealControlError,
+            r"position.*joint=2.*measured_q=\+1\.051000.*"
+            r"threshold=\[-1\.050000,\+1\.050000\]",
+        ):
             validate_policy_runtime_inputs(
                 0.1,
                 0.1,
@@ -160,7 +164,11 @@ class RealControlSafetyTest(unittest.TestCase):
             )
         position[2] = 0.0
         velocity[5] = 20.11
-        with self.assertRaisesRegex(RealControlError, "velocity"):
+        with self.assertRaisesRegex(
+            RealControlError,
+            r"velocity.*joint=5.*measured_dq=\+20\.110000.*"
+            r"limit=\+20\.000000.*threshold=\+20\.100000",
+        ):
             validate_policy_runtime_inputs(
                 0.1,
                 0.1,

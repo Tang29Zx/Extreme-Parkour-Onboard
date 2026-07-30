@@ -203,16 +203,46 @@ def validate_policy_runtime_inputs(
         raise RealControlError("joint velocity limits must be positive")
 
     tolerance = POLICY_STATE_LIMIT_TOLERANCE_RAD
-    if bool(
-        np.any(position < lower - tolerance)
-        or np.any(position > upper + tolerance)
-    ):
-        raise RealControlError("measured joint position exceeded its limit")
+    position_threshold_low = lower - tolerance
+    position_threshold_high = upper + tolerance
+    position_violations = np.flatnonzero(
+        (position < position_threshold_low)
+        | (position > position_threshold_high)
+    )
+    if position_violations.size:
+        details = []
+        for joint in position_violations:
+            details.append(
+                f"joint={int(joint)} "
+                f"measured_q={position[joint]:+.6f} "
+                f"limit=[{lower[joint]:+.6f},{upper[joint]:+.6f}] "
+                f"threshold=[{position_threshold_low[joint]:+.6f},"
+                f"{position_threshold_high[joint]:+.6f}]"
+            )
+        raise RealControlError(
+            "measured joint position exceeded its limit; "
+            + "; ".join(details)
+        )
     velocity_threshold = velocity_limits * (
         1.0 + POLICY_JOINT_VELOCITY_LIMIT_REL_TOLERANCE
     )
-    if bool(np.any(np.abs(velocity) > velocity_threshold)):
-        raise RealControlError("measured joint velocity exceeded its limit")
+    velocity_violations = np.flatnonzero(
+        np.abs(velocity) > velocity_threshold
+    )
+    if velocity_violations.size:
+        details = []
+        for joint in velocity_violations:
+            details.append(
+                f"joint={int(joint)} "
+                f"measured_q={position[joint]:+.6f} "
+                f"measured_dq={velocity[joint]:+.6f} "
+                f"limit={velocity_limits[joint]:+.6f} "
+                f"threshold={velocity_threshold[joint]:+.6f}"
+            )
+        raise RealControlError(
+            "measured joint velocity exceeded its limit; "
+            + "; ".join(details)
+        )
 
 
 def validate_policy_request_input(remote_age_s: float) -> None:
