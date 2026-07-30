@@ -6,7 +6,7 @@ from unittest import mock
 import numpy as np
 
 import flight_recorder as flight_recorder_module
-from flight_recorder import FlightRecorder
+from flight_recorder import CONTROL_CAPACITY, VISUAL_CAPACITY, FlightRecorder
 
 
 class FlightRecorderTest(unittest.TestCase):
@@ -87,6 +87,32 @@ class FlightRecorderTest(unittest.TestCase):
             self.assertEqual(len(recorder.control_records), 0)
             self.assertEqual(len(recorder.visual_records), 0)
             self.assertIsNone(recorder.flush("empty"))
+
+    def test_default_capacity_retains_ten_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = FlightRecorder(directory)
+            recorder._next_checkpoint_time = float("inf")
+
+            for index in range(CONTROL_CAPACITY + 1):
+                self._record_control(recorder, index)
+            for index in range(VISUAL_CAPACITY + 1):
+                recorder.record_visual(
+                    timestamp=100.0 + index,
+                    depth_input=np.zeros((58, 87), dtype=np.float32),
+                    visual_output=np.zeros(34),
+                )
+
+            self.assertEqual(CONTROL_CAPACITY, 500)
+            self.assertEqual(VISUAL_CAPACITY, 100)
+            self.assertEqual(len(recorder.control_records), 500)
+            self.assertEqual(len(recorder.visual_records), 100)
+            self.assertEqual(recorder.control_records[0]["timestamp"], 101.0)
+            self.assertEqual(recorder.visual_records[0]["timestamp"], 101.0)
+
+            path = recorder.flush("ten_second_window")
+            with np.load(path, allow_pickle=False) as data:
+                self.assertEqual(data["control_timestamp"].shape, (500,))
+                self.assertEqual(data["depth_input"].shape, (100, 58, 87))
 
     def test_nonfinite_sample_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

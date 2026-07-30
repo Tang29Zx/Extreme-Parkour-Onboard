@@ -108,7 +108,7 @@ raw_action (12 finite values)
 深度超时进入站姿恢复；不符合逃逸条件或`0.30`后仍无交集时，与LowState超时一样
 发送motor-off尾帧并锁定在`emergency_stop`。
 
-运行时使用250周期控制环形缓冲和50帧视觉环形缓冲，不在控制循环写磁盘或打印完整
+运行时使用500周期控制环形缓冲和100帧视觉环形缓冲，约覆盖最近10秒，不在控制循环写磁盘或打印完整
 tensor。L2、R2、异常和退出时将原始/实际动作、请求/下发/实测关节状态、IMU、足端力、
 输入年龄、视觉统计和循环耗时写入`--flight-log-dir`下的时间戳NPZ。
 
@@ -222,13 +222,13 @@ depth_stats       float32 (N, 3)       # min, max, mean of depth_input
 visual_output     float32 (N, 34)
 ```
 
-`visual_records`继续使用容量50的`deque`，单帧深度占20184字节，50帧约1.01 MB。
+`visual_records`使用容量100的`deque`，单帧深度占20184字节，100帧约2.02 MB。
 旧v1/v2读取端按字段名读取时不受影响，新读取端必须通过`format_version`或字段存在性
 兼容旧日志。
 
 ### 抗整机复位检查点
 
-`FlightRecorder`保留250周期/50帧内存环形缓冲，首个控制样本立即请求检查点，
+`FlightRecorder`保留500周期/100帧内存环形缓冲，首个控制样本立即请求检查点，
 之后以`0.5 s`为默认间隔请求滚动检查点。请求在`record_control()`尾部只完成
 加锁快照和后台线程启动；
 `np.savez_compressed()`、磁盘写入和同步均不在50 Hz控制线程执行。同一时刻最多

@@ -11,8 +11,8 @@ from typing import Deque, Dict, Optional, Sequence
 import numpy as np
 
 
-CONTROL_CAPACITY = 250
-VISUAL_CAPACITY = 50
+CONTROL_CAPACITY = 500  # 10 seconds at 50 Hz.
+VISUAL_CAPACITY = 100  # 10 seconds at 10 Hz.
 DEPTH_INPUT_SHAPE = (58, 87)
 FORMAT_VERSION = 4
 CHECKPOINT_INTERVAL_S = 0.5

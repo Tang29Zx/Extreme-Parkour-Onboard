@@ -93,10 +93,74 @@ CheckMode确认Sport Mode已释放后，节点立即发送锁存位姿保持命�
 - `Ctrl+C`退出时也会发送10帧motor-off命令，因此只能在支架承重时停止。
 - `--flight-log-dir`可指定飞行记录目录，默认`~/extreme-flight-logs`。首个控制样本
   会立即启动后台检查点，之后每0.5秒原子替换一份带`checkpoint`的耐久NPZ；
-  Jetson突发复位后直接分析该文件。L2、R2、异常或退出时仍会保存最近5秒
+  Jetson突发复位后直接分析该文件。L2、R2、异常或退出时仍会保存最近10秒
   的最终时间戳NPZ，确认落盘后再删除检查点。NPZ v4包含12电机温度、`lost`、
   估算力矩、四足接触、与视觉编码对应的`58×87` `depth_input`，以及急停的
   `reason/detail`。压缩和磁盘写入均不在50 Hz控制线程执行。
+
+#### 当前V1-Log标准带日志启动命令
+
+以下单终端命令适用于Jetson活动目录`/home/unitree/Extreme-Parkour-Onboard`、
+正装D435i、`traced`成对权重、parkour模式和timer控制循环。它先在后台启动视觉
+节点，最多等待10秒确认`/forward_depth_image`，再以前台方式启动控制节点；控制
+进程退出、报错或收到`Ctrl+C`后会清理视觉进程。每次运行在
+`~/extreme-runtime-logs/v1log-<时间>`下分别保存视觉日志、控制日志和最近10秒的
+飞行记录。
+
+```bash
+cd /home/unitree/Extreme-Parkour-Onboard
+source scripts/jetson_env.sh
+set -o pipefail
+
+RUN_ID="v1log-$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="$HOME/extreme-runtime-logs/$RUN_ID"
+mkdir -p "$RUN_DIR/flight"
+
+echo "Run directory: $RUN_DIR"
+
+python3 -u visual_extreme_parkour.py \
+  --logdir traced \
+  >"$RUN_DIR/visual.log" 2>&1 &
+VISUAL_PID=$!
+
+cleanup() {
+  kill "$VISUAL_PID" 2>/dev/null || true
+  wait "$VISUAL_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+for _ in $(seq 1 20); do
+  if ros2 topic list 2>/dev/null | grep -qx '/forward_depth_image'; then
+    break
+  fi
+  if ! kill -0 "$VISUAL_PID" 2>/dev/null; then
+    echo "Visual node exited:"
+    tail -n 80 "$RUN_DIR/visual.log"
+    exit 1
+  fi
+  sleep 0.5
+done
+
+if ! ros2 topic list 2>/dev/null | grep -qx '/forward_depth_image'; then
+  echo "Depth topic did not become ready:"
+  tail -n 80 "$RUN_DIR/visual.log"
+  exit 1
+fi
+
+PYTHONUNBUFFERED=1 python3 -u run_extreme_parkour.py \
+  --logdir traced \
+  --mode parkour \
+  --loop_mode timer \
+  --nodryrun \
+  --flight-log-dir "$RUN_DIR/flight" \
+  2>&1 | tee "$RUN_DIR/controller.log"
+
+echo "Logs saved in: $RUN_DIR"
+```
+
+其中`--nodryrun`会启用真实`/lowcmd`输出，只能在完成现场安全准备后使用。支架验收
+或纯状态机检查时删除该参数；更换权重目录、相机安装方向或控制模式时，这段命令不能
+原样视为已验收配置，必须同步修改参数并重新完成对应检查。
 
 控制节点运行后，可在第三个终端只读查看2 Hz实时状态：
 
